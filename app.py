@@ -1,6 +1,6 @@
 import os
 import json
-import sqlite3e
+import sqlite3
 import httpx
 import logging
 from datetime import datetime, timedelta
