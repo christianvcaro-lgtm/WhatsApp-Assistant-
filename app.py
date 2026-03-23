@@ -122,7 +122,6 @@ def build_system_prompt():
     current_time = now.strftime("%H:%M")
     day_name = ["lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo"][now.weekday()]
 
-    # Get personal context
     ctx = get_all_context()
     context_block = ""
     if ctx:
@@ -130,7 +129,6 @@ def build_system_prompt():
         for k, v in ctx.items():
             context_block = context_block + "- " + k + ": " + v + "\n"
 
-    # Get current tasks summary
     tasks = get_pending_tasks()
     tasks_block = ""
     if tasks:
@@ -141,7 +139,6 @@ def build_system_prompt():
         if len(tasks) > 10:
             tasks_block = tasks_block + "... y " + str(len(tasks) - 10) + " mas\n"
 
-    # Get recent ideas
     ideas = get_recent_ideas(5)
     ideas_block = ""
     if ideas:
@@ -237,7 +234,6 @@ async def interpret_message(text):
     prompt = build_system_prompt()
     messages = [{"role": "system", "content": prompt}]
 
-    # Add conversation history for context
     history = get_recent_conversations(10)
     messages.extend(history)
     messages.append({"role": "user", "content": text})
@@ -245,7 +241,7 @@ async def interpret_message(text):
     try:
         response = openai_client.chat.completions.create(
             model="gpt-5.4-mini",
-           max_completion_tokens=1024,
+            max_completion_tokens=1024,
             temperature=0.7,
             messages=messages
         )
@@ -253,7 +249,6 @@ async def interpret_message(text):
         raw = raw.replace("```json", "").replace("```", "").strip()
         parsed = json.loads(raw)
 
-        # Save conversation
         save_conversation("user", text)
         save_conversation("assistant", parsed.get("response", ""))
 
@@ -447,10 +442,31 @@ async def send_whatsapp(to, message):
             logger.error("Error enviando WhatsApp: %s", e)
 
 
+async def transcribe_audio(media_id):
+    async with httpx.AsyncClient() as http:
+        resp = await http.get(
+            "https://graph.facebook.com/v22.0/" + media_id,
+            headers={"Authorization": "Bearer " + WHATSAPP_TOKEN},
+            timeout=10
+        )
+        media_url = resp.json().get("url", "")
+        audio_resp = await http.get(
+            media_url,
+            headers={"Authorization": "Bearer " + WHATSAPP_TOKEN},
+            timeout=30
+        )
+        audio_bytes = audio_resp.content
+    audio_file = ("audio.ogg", audio_bytes, "audio/ogg")
+    transcript = openai_client.audio.transcriptions.create(
+        model="whisper-1",
+        file=audio_file
+    )
+    return transcript.text
+
+
 async def process_message(phone, text):
     lower = text.strip().lower()
 
-    # Quick commands without spending tokens
     if lower in ["resumen", "como voy", "status"]:
         return await send_whatsapp(phone, format_summary(get_today_summary()))
     if lower in ["pendientes", "tareas", "mis tareas"]:
@@ -471,14 +487,11 @@ async def process_message(phone, text):
             "- _Recuerdame a las 3pm revisar metricas_\n"
             "- _Ya hice lo de Juan_\n\n"
             "*Ensenami cosas:*\n"
-            "- _Recuerda que mi prioridad es cerrar 3 ventas esta semana_\n"
-            "- _Ten en cuenta que el lanzamiento de YAVE es en abril_\n\n"
-            "*O simplemente hablame:*\n"
-            "- _Estoy pensando en cambiar la estrategia de pricing_\n"
-            "- _Como deberia priorizar mi semana?_"
+            "- _Recuerda que mi prioridad es cerrar 3 ventas_\n"
+            "- _Ten en cuenta que el lanzamiento es en abril_\n\n"
+            "*Tambien puedes enviarme notas de voz!*"
         )
 
-    # Smart processing with GPT-4o
     result = await interpret_message(text)
     intent = result.get("intent", "chat")
     data = result.get("data", {})
@@ -576,7 +589,6 @@ async def morning_summary():
         for t in high[:3]:
             msg = msg + "\n  " + C_EMOJI.get(t["category"], "\U0001f4cc") + " " + t["title"]
 
-    # Add context-aware nudge
     priority = ctx.get("prioridad_semana", ctx.get("prioridad", ""))
     if priority:
         msg = msg + "\n\n\U0001f4ad Recuerda: " + priority
@@ -636,14 +648,24 @@ async def receive_webhook(request: Request):
             for change in entry.get("changes", []):
                 messages = change.get("value", {}).get("messages", [])
                 for msg in messages:
+                    phone = msg["from"]
+                    if MY_PHONE_NUMBER and phone != MY_PHONE_NUMBER:
+                        logger.warning("Numero no autorizado: %s", phone)
+                        continue
                     if msg.get("type") == "text":
-                        phone = msg["from"]
                         text = msg["text"]["body"]
                         logger.info("Mensaje de %s: %s", phone, text)
-                        if MY_PHONE_NUMBER and phone != MY_PHONE_NUMBER:
-                            logger.warning("Numero no autorizado: %s", phone)
-                            continue
                         await process_message(phone, text)
+                    elif msg.get("type") == "audio":
+                        logger.info("Audio de %s", phone)
+                        try:
+                            media_id = msg["audio"]["id"]
+                            text = await transcribe_audio(media_id)
+                            logger.info("Transcripcion: %s", text)
+                            await process_message(phone, text)
+                        except Exception as e:
+                            logger.error("Error transcribiendo audio: %s", e)
+                            await send_whatsapp(phone, "No pude entender el audio. Intenta de nuevo o escribeme.")
     except Exception as e:
         logger.error("Webhook error: %s", e)
     return {"status": "ok"}
