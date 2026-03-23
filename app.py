@@ -1,6 +1,6 @@
 import os
 import json
-import sqlite3
+import sqlite3e
 import httpx
 import logging
 from datetime import datetime, timedelta
@@ -244,7 +244,7 @@ async def interpret_message(text):
 
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-5.4-mini-2026-03-17",
+            model="gpt-5.4-mini",
             max_tokens=1024,
             temperature=0.7,
             messages=messages
