@@ -67,68 +67,200 @@ def init_db():
             "remind_at TEXT NOT NULL,"
             "sent INTEGER DEFAULT 0,"
             "created_at TEXT DEFAULT (datetime('now')));"
+            "CREATE TABLE IF NOT EXISTS context ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "key TEXT NOT NULL,"
+            "value TEXT NOT NULL,"
+            "created_at TEXT DEFAULT (datetime('now')),"
+            "updated_at TEXT DEFAULT (datetime('now')));"
+            "CREATE TABLE IF NOT EXISTS conversations ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "role TEXT NOT NULL,"
+            "content TEXT NOT NULL,"
+            "created_at TEXT DEFAULT (datetime('now')));"
         )
 
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 
+def get_all_context():
+    with get_db() as conn:
+        rows = conn.execute("SELECT key, value FROM context ORDER BY updated_at DESC").fetchall()
+        return {r["key"]: r["value"] for r in rows}
+
+
+def set_context(key, value):
+    with get_db() as conn:
+        existing = conn.execute("SELECT id FROM context WHERE key=?", (key,)).fetchone()
+        if existing:
+            conn.execute("UPDATE context SET value=?, updated_at=datetime('now') WHERE key=?", (value, key))
+        else:
+            conn.execute("INSERT INTO context (key, value) VALUES (?, ?)", (key, value))
+
+
+def get_recent_conversations(limit=20):
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT role, content FROM conversations ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+
+
+def save_conversation(role, content):
+    with get_db() as conn:
+        conn.execute("INSERT INTO conversations (role, content) VALUES (?, ?)", (role, content))
+        conn.execute(
+            "DELETE FROM conversations WHERE id NOT IN "
+            "(SELECT id FROM conversations ORDER BY id DESC LIMIT 50)"
+        )
+
+
 def build_system_prompt():
     now = datetime.now(tz)
     current_date = now.strftime("%Y-%m-%d")
     current_time = now.strftime("%H:%M")
+    day_name = ["lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo"][now.weekday()]
+
+    # Get personal context
+    ctx = get_all_context()
+    context_block = ""
+    if ctx:
+        context_block = "\n\nCONOCIMIENTO PERSONAL DE CHRISTIAN:\n"
+        for k, v in ctx.items():
+            context_block = context_block + "- " + k + ": " + v + "\n"
+
+    # Get current tasks summary
+    tasks = get_pending_tasks()
+    tasks_block = ""
+    if tasks:
+        tasks_block = "\n\nTAREAS PENDIENTES ACTUALES (" + str(len(tasks)) + "):\n"
+        for t in tasks[:10]:
+            due = " [vence: " + t["due_date"] + "]" if t.get("due_date") else ""
+            tasks_block = tasks_block + "- [" + t["priority"] + "] [" + t["category"] + "] " + t["title"] + due + "\n"
+        if len(tasks) > 10:
+            tasks_block = tasks_block + "... y " + str(len(tasks) - 10) + " mas\n"
+
+    # Get recent ideas
+    ideas = get_recent_ideas(5)
+    ideas_block = ""
+    if ideas:
+        ideas_block = "\n\nIDEAS RECIENTES:\n"
+        for i in ideas:
+            ideas_block = ideas_block + "- [" + i["category"] + "] " + i["content"] + "\n"
+
     prompt = (
-        "Eres el asistente personal de Christian por WhatsApp. "
-        "Maneja YAVE (CRM WhatsApp para inmobiliarias) y Los Lagos (lotes campestres Cartagena). "
-        "Te habla en español colombiano informal.\n\n"
-        "RESPONDE SOLO JSON VALIDO. Sin markdown, sin backticks.\n\n"
+        "Eres el asistente personal de Christian. No eres un bot generico, eres SU asistente. "
+        "Conoces sus proyectos, sus prioridades, su forma de pensar. "
+        "Te habla por WhatsApp en espanol colombiano informal.\n\n"
+
+        "QUIEN ES CHRISTIAN:\n"
+        "- Emprendedor colombiano con dos proyectos activos\n"
+        "- YAVE: CRM de WhatsApp con IA para inmobiliarias (en desarrollo y validacion)\n"
+        "- Los Lagos: desarrollo de lotes campestres cerca de Cartagena con financiamiento directo\n"
+        "- Es estratega, ejecutor, le gusta ir directo al grano\n"
+        "- Juega padel, vive en Colombia\n"
+        + context_block +
+
+        "\n\nTU PERSONALIDAD:\n"
+        "- Eres directo, inteligente, y genuinamente util. No eres lambiscone.\n"
+        "- Hablas como un socio de confianza, no como un chatbot corporativo.\n"
+        "- Si Christian esta disperso o haciendo mucho, se lo dices.\n"
+        "- Si una idea no tiene sentido, cuestionala con respeto pero sin miedo.\n"
+        "- Ayudas a PRIORIZAR, no solo a guardar cosas. Eso es clave.\n"
+        "- Respondes conciso porque esto es WhatsApp. Nada de parrafos largos.\n"
+        "- Puedes usar emojis con moderacion.\n"
+        "- Si no entiendes algo, preguntas. No asumes.\n"
+
+        "\n\nQUE PUEDES HACER:\n"
+        "1. Guardar tareas, ideas, recordatorios\n"
+        "2. Dar resumen del dia, pendientes, ideas\n"
+        "3. Recordar informacion personal que Christian te ensene\n"
+        "4. Ayudar a pensar, priorizar, decidir\n"
+        "5. Tener conversaciones normales como un asistente real\n"
+        "6. Cuestionar cuando algo no tiene sentido\n"
+
+        "\n\nCOMO RESPONDER:\n"
+        "Responde SIEMPRE en JSON valido. Sin markdown, sin backticks.\n\n"
         "Estructura:\n"
-        '{"intent": "task|idea|reminder|query|complete|chat", '
-        '"data": {...}, '
-        '"response": "Respuesta corta para WhatsApp"}\n\n'
-        "INTENTS:\n"
-        '- "tengo que","necesito","hay que","pendiente","hacer","tarea" = task\n'
-        '- "idea","se me ocurrio","que tal si","podriamos" = idea\n'
-        '- "recuerdame","no se me olvide","avisame","a las X" = reminder\n'
-        '- "que tengo","pendientes","resumen","como voy","mis tareas","mis ideas" = query\n'
-        '- "listo","hecho","ya hice","termine","complete" = complete\n'
-        "- Otra cosa = chat (responde y sugiere si quiere guardarlo)\n\n"
+        '{"intent": "TIPO", "data": {...}, "response": "Tu respuesta para WhatsApp"}\n\n'
+
+        "INTENTS POSIBLES:\n"
+        '- task: cuando quiere agregar algo que HACER (detecta: "tengo que", "necesito", "hay que", "pendiente", "hacer", "tarea")\n'
+        '- idea: cuando tiene una IDEA (detecta: "idea", "se me ocurrio", "que tal si", "podriamos")\n'
+        '- reminder: cuando quiere un RECORDATORIO (detecta: "recuerdame", "no se me olvide", "avisame", "a las X")\n'
+        '- query: cuando PREGUNTA por sus cosas (detecta: "que tengo", "pendientes", "resumen", "como voy", "mis tareas")\n'
+        '- complete: cuando COMPLETO algo (detecta: "listo", "hecho", "ya hice", "termine")\n'
+        '- learn: cuando te ENSENA algo sobre el o sus proyectos (detecta: "recuerda que", "mi prioridad es", "ten en cuenta", "aprende que", "esto es importante")\n'
+        '- chat: conversacion normal, consejo, ayuda para pensar\n\n'
+
         "DATA POR INTENT:\n"
-        'task: {"title":"corto","description":"detalle o null","priority":"alta|media|baja",'
-        '"category":"yave|loslagos|personal|general","due_date":"YYYY-MM-DD o null"}\n'
-        'idea: {"content":"la idea","category":"yave|loslagos|personal|general","tags":["tag1"]}\n'
+        'task: {"title":"corto","description":"detalle o null","priority":"alta|media|baja","category":"yave|loslagos|personal|general","due_date":"YYYY-MM-DD o null"}\n'
+        'idea: {"content":"la idea completa","category":"yave|loslagos|personal|general","tags":["tag1"]}\n'
         'reminder: {"message":"que recordar","remind_at":"YYYY-MM-DD HH:MM"}\n'
-        'query: {"query_type":"pending_tasks|ideas|today|overdue|category",'
-        '"category":"yave|loslagos|personal|general o null"}\n'
+        'query: {"query_type":"pending_tasks|ideas|today|overdue|category","category":"opcional"}\n'
         'complete: {"search_term":"texto para buscar la tarea"}\n'
-        "chat: {}\n\n"
-        "PRIORIDAD: urgente/hoy/asap=alta | fecha<3dias=alta | sin fecha=media | cuando pueda=baja\n"
-        "CATEGORIA: WhatsApp,CRM,API,Meta,codigo=yave | lotes,Cartagena,ventas=loslagos | "
-        "gym,padel,familia=personal | resto=general\n\n"
-        "FECHA: " + current_date + " | HORA: " + current_time + "\n\n"
+        'learn: {"key":"tema corto","value":"lo que debe recordar"}\n'
+        'chat: {}\n\n'
+
+        "REGLAS DE PRIORIDAD:\n"
+        "- urgente/hoy/asap = alta\n"
+        "- fecha < 3 dias = alta\n"
+        "- sin fecha ni urgencia = media\n"
+        "- cuando pueda/algun dia = baja\n\n"
+
+        "REGLAS DE CATEGORIA:\n"
+        "- WhatsApp, CRM, API, Meta, codigo, tech, desarrollo = yave\n"
+        "- lotes, Cartagena, ventas, financiamiento, campestre = loslagos\n"
+        "- gym, padel, familia, salud = personal\n"
+        "- resto = general\n\n"
+
+        "REGLAS DE INTELIGENCIA:\n"
+        "- Si te dice algo vago como 'tengo que hacer cosas de YAVE', preguntale QUE cosas especificamente.\n"
+        "- Si agrega una tarea baja cuando tiene 5 altas pendientes, dile algo como 'ojo que tienes 5 urgentes, seguro quieres agregar mas?'\n"
+        "- Si no ha completado tareas en un rato, motivalo o preguntale que esta pasando.\n"
+        "- Si una idea se repite o contradice algo anterior, mencionalo.\n"
+        "- En el chat, se genuinamente util. Ayuda a pensar, no solo a responder.\n"
+        "- IMPORTANTE: en tu response, incluye la confirmacion de la accion Y cualquier comentario inteligente que tengas.\n"
+        + tasks_block
+        + ideas_block +
+
+        "\n\nFECHA: " + current_date + " (" + day_name + ") | HORA: " + current_time + "\n\n"
         "Para reminders: calcula fecha/hora real. "
-        '"manana a las 8" = fecha de manana 08:00. '
-        '"en 2 horas" = suma desde hora actual.'
+        "'manana a las 8' = fecha de manana 08:00. "
+        "'en 2 horas' = suma desde hora actual."
     )
     return prompt
 
 
 async def interpret_message(text):
     prompt = build_system_prompt()
+    messages = [{"role": "system", "content": prompt}]
+
+    # Add conversation history for context
+    history = get_recent_conversations(10)
+    messages.extend(history)
+    messages.append({"role": "user", "content": text})
+
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             max_tokens=1024,
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": text}
-            ]
+            temperature=0.7,
+            messages=messages
         )
         raw = response.choices[0].message.content.strip()
         raw = raw.replace("```json", "").replace("```", "").strip()
-        return json.loads(raw)
+        parsed = json.loads(raw)
+
+        # Save conversation
+        save_conversation("user", text)
+        save_conversation("assistant", parsed.get("response", ""))
+
+        return parsed
     except json.JSONDecodeError:
         logger.error("JSON parse error. Raw: %s", raw)
+        save_conversation("user", text)
         return {"intent": "chat", "data": {}, "response": "No entendi bien, puedes reformularlo?"}
     except Exception as e:
         logger.error("OpenAI error: %s", e)
@@ -317,6 +449,8 @@ async def send_whatsapp(to, message):
 
 async def process_message(phone, text):
     lower = text.strip().lower()
+
+    # Quick commands without spending tokens
     if lower in ["resumen", "como voy", "status"]:
         return await send_whatsapp(phone, format_summary(get_today_summary()))
     if lower in ["pendientes", "tareas", "mis tareas"]:
@@ -326,17 +460,25 @@ async def process_message(phone, text):
     if lower == "ayuda":
         return await send_whatsapp(
             phone,
-            "\U0001f916 *COMANDOS RAPIDOS*\n\n"
+            "\U0001f916 *SOY TU ASISTENTE PERSONAL*\n\n"
+            "*Comandos rapidos:*\n"
             "\U0001f4cb *pendientes* = ver tareas\n"
             "\U0001f4a1 *ideas* = ver ideas\n"
             "\U0001f4ca *resumen* = resumen del dia\n\n"
-            "O simplemente escribeme natural:\n"
+            "*Hablame natural:*\n"
             "- _Tengo que llamar a Juan manana_\n"
             "- _Idea: hacer webinar de YAVE_\n"
             "- _Recuerdame a las 3pm revisar metricas_\n"
-            "- _Ya hice lo de Juan_"
+            "- _Ya hice lo de Juan_\n\n"
+            "*Ensenami cosas:*\n"
+            "- _Recuerda que mi prioridad es cerrar 3 ventas esta semana_\n"
+            "- _Ten en cuenta que el lanzamiento de YAVE es en abril_\n\n"
+            "*O simplemente hablame:*\n"
+            "- _Estoy pensando en cambiar la estrategia de pricing_\n"
+            "- _Como deberia priorizar mi semana?_"
         )
 
+    # Smart processing with GPT-4o
     result = await interpret_message(text)
     intent = result.get("intent", "chat")
     data = result.get("data", {})
@@ -349,18 +491,23 @@ async def process_message(phone, text):
         msg = "\u2705 Tarea #" + str(tid) + " guardada\n" + p + c + " *" + data.get("title", "") + "*"
         if data.get("due_date"):
             msg = msg + "\n\u23f0 Para: " + data["due_date"]
+        if response_text and response_text != data.get("title", ""):
+            msg = msg + "\n\n" + response_text
         await send_whatsapp(phone, msg)
 
     elif intent == "idea":
         iid = add_idea(data)
-        await send_whatsapp(phone, "\U0001f4a1 Idea #" + str(iid) + " guardada\n_" + data.get("content", "") + "_")
+        msg = "\U0001f4a1 Idea #" + str(iid) + " guardada\n_" + data.get("content", "") + "_"
+        if response_text and response_text != data.get("content", ""):
+            msg = msg + "\n\n" + response_text
+        await send_whatsapp(phone, msg)
 
     elif intent == "reminder":
         rid = add_reminder(data)
-        await send_whatsapp(
-            phone,
-            "\u23f0 Recordatorio #" + str(rid) + "\n_" + data.get("message", "") + "_\n\U0001f550 " + data.get("remind_at", "")
-        )
+        msg = "\u23f0 Recordatorio #" + str(rid) + "\n_" + data.get("message", "") + "_\n\U0001f550 " + data.get("remind_at", "")
+        if response_text:
+            msg = msg + "\n\n" + response_text
+        await send_whatsapp(phone, msg)
 
     elif intent == "query":
         qt = data.get("query_type", "pending_tasks")
@@ -385,9 +532,21 @@ async def process_message(phone, text):
         if found and found.startswith("MULTIPLE:"):
             await send_whatsapp(phone, "\U0001f914 Varias coinciden:\n" + found[9:] + "\n\nSe mas especifico.")
         elif found:
-            await send_whatsapp(phone, "\U0001f389 *Completada:* " + found)
+            msg = "\U0001f389 *Completada:* " + found
+            if response_text:
+                msg = msg + "\n\n" + response_text
+            await send_whatsapp(phone, msg)
         else:
             await send_whatsapp(phone, "\U0001f50d No encontre esa tarea. Escribe *pendientes* para ver la lista.")
+
+    elif intent == "learn":
+        key = data.get("key", "")
+        value = data.get("value", "")
+        if key and value:
+            set_context(key, value)
+            await send_whatsapp(phone, "\U0001f9e0 Listo, me lo guarde.\n\n" + response_text)
+        else:
+            await send_whatsapp(phone, response_text)
 
     else:
         await send_whatsapp(phone, response_text)
@@ -408,11 +567,20 @@ async def morning_summary():
         return
     summary = get_today_summary()
     high = [t for t in get_pending_tasks() if t["priority"] == "alta"]
+    ctx = get_all_context()
+
     msg = "\u2600\ufe0f *Buenos dias, Christian*\n\n" + format_summary(summary)
+
     if high:
         msg = msg + "\n\n\U0001f3af *FOCUS HOY:*"
         for t in high[:3]:
             msg = msg + "\n  " + C_EMOJI.get(t["category"], "\U0001f4cc") + " " + t["title"]
+
+    # Add context-aware nudge
+    priority = ctx.get("prioridad_semana", ctx.get("prioridad", ""))
+    if priority:
+        msg = msg + "\n\n\U0001f4ad Recuerda: " + priority
+
     await send_whatsapp(MY_PHONE_NUMBER, msg)
 
 
@@ -426,11 +594,11 @@ async def evening_review():
         "\U0001f4cb Quedan *" + str(s["pending"]) + "* pendientes"
     )
     if s["overdue"]:
-        msg = msg + "\n\u26a0\ufe0f *" + str(len(s["overdue"])) + "* vencidas"
+        msg = msg + "\n\u26a0\ufe0f *" + str(len(s["overdue"])) + "* vencidas - no las pierdas de vista"
     await send_whatsapp(MY_PHONE_NUMBER, msg)
 
 
-app = FastAPI(title="Asistente Personal WhatsApp")
+app = FastAPI(title="Asistente Personal WhatsApp v2")
 
 
 @app.on_event("startup")
@@ -440,7 +608,7 @@ async def startup():
     scheduler.add_job(morning_summary, CronTrigger(hour=7, minute=0), id="morning")
     scheduler.add_job(evening_review, CronTrigger(hour=21, minute=0), id="evening")
     scheduler.start()
-    logger.info("Asistente Personal iniciado")
+    logger.info("Asistente Personal v2 iniciado")
 
 
 @app.on_event("shutdown")
@@ -483,7 +651,7 @@ async def receive_webhook(request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "running", "time": datetime.now(tz).isoformat()}
+    return {"status": "running", "version": "v2", "time": datetime.now(tz).isoformat()}
 
 
 @app.get("/tasks")
@@ -499,3 +667,8 @@ async def api_ideas():
 @app.get("/summary")
 async def api_summary():
     return get_today_summary()
+
+
+@app.get("/context")
+async def api_context():
+    return get_all_context()
