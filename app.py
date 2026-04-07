@@ -2,6 +2,7 @@ import os
 import json
 import sqlite3
 import httpx
+import base64
 import logging
 from datetime import datetime, timedelta
 from contextlib import contextmanager
@@ -21,6 +22,8 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 MY_PHONE_NUMBER = os.environ.get("MY_PHONE_NUMBER", "")
 TIMEZONE = os.environ.get("TIMEZONE", "America/Bogota")
 DB_PATH = os.environ.get("DB_PATH", "assistant.db")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+VAULT_REPO = os.environ.get("VAULT_REPO", "christianvcaro-lgtm/obsidian-vault")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -464,6 +467,26 @@ async def transcribe_audio(media_id):
     return transcript.text
 
 
+async def push_to_vault(content: str, folder: str, filename: str):
+    if not GITHUB_TOKEN:
+        return
+    url = f"https://api.github.com/repos/{VAULT_REPO}/contents/{folder}/{filename}"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    encoded = base64.b64encode(content.encode()).decode()
+    async with httpx.AsyncClient() as http:
+        try:
+            await http.put(url, headers=headers, json={
+                "message": f"capture: {filename}",
+                "content": encoded
+            }, timeout=10)
+            logger.info("Vault: nota guardada en %s/%s", folder, filename)
+        except Exception as e:
+            logger.error("Error escribiendo en vault: %s", e)
+
+
 async def process_message(phone, text):
     lower = text.strip().lower()
 
@@ -507,6 +530,23 @@ async def process_message(phone, text):
         if response_text and response_text != data.get("title", ""):
             msg = msg + "\n\n" + response_text
         await send_whatsapp(phone, msg)
+        fecha = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
+        md = (
+            "---\n"
+            "fecha: " + datetime.now(tz).strftime("%Y-%m-%d") + "\n"
+            "tipo: tarea\n"
+            "prioridad: " + data.get("priority", "media") + "\n"
+            "proyecto: " + data.get("category", "general") + "\n"
+            + ("vence: " + data["due_date"] + "\n" if data.get("due_date") else "") +
+            "procesado: false\n"
+            "---\n\n"
+            "# " + data.get("title", "") + "\n\n"
+            + (data.get("description", "") + "\n\n" if data.get("description") else "") +
+            "---\n"
+            "*Capturado desde WhatsApp el " + fecha + "*\n"
+        )
+        fname = datetime.now(tz).strftime("%Y-%m-%d-%H%M") + "-tarea-" + str(tid) + ".md"
+        await push_to_vault(md, "inbox", fname)
 
     elif intent == "idea":
         iid = add_idea(data)
@@ -514,6 +554,21 @@ async def process_message(phone, text):
         if response_text and response_text != data.get("content", ""):
             msg = msg + "\n\n" + response_text
         await send_whatsapp(phone, msg)
+        fecha = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
+        md = (
+            "---\n"
+            "fecha: " + datetime.now(tz).strftime("%Y-%m-%d") + "\n"
+            "tipo: idea\n"
+            "proyecto: " + data.get("category", "general") + "\n"
+            "procesado: false\n"
+            "---\n\n"
+            "# " + data.get("content", "")[:60] + "\n\n"
+            + data.get("content", "") + "\n\n"
+            "---\n"
+            "*Capturado desde WhatsApp el " + fecha + "*\n"
+        )
+        fname = datetime.now(tz).strftime("%Y-%m-%d-%H%M") + "-idea-" + str(iid) + ".md"
+        await push_to_vault(md, "inbox", fname)
 
     elif intent == "reminder":
         rid = add_reminder(data)
