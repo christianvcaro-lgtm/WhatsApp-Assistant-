@@ -467,24 +467,104 @@ async def transcribe_audio(media_id):
     return transcript.text
 
 
+TASK_FOLDER = {
+    "loslagos": "proyectos/los-lagos",
+    "yave": "proyectos/yave",
+    "personal": "tareas",
+    "general": "tareas",
+}
+
+IDEA_FOLDER = {
+    "loslagos": "proyectos/los-lagos",
+    "yave": "proyectos/yave",
+    "personal": "inbox",
+    "general": "inbox",
+}
+
+
+def _vault_headers():
+    return {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+
 async def push_to_vault(content: str, folder: str, filename: str):
     if not GITHUB_TOKEN:
         return
     url = f"https://api.github.com/repos/{VAULT_REPO}/contents/{folder}/{filename}"
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
-    }
     encoded = base64.b64encode(content.encode()).decode()
     async with httpx.AsyncClient() as http:
         try:
-            await http.put(url, headers=headers, json={
+            await http.put(url, headers=_vault_headers(), json={
                 "message": f"capture: {filename}",
-                "content": encoded
+                "content": encoded,
             }, timeout=10)
             logger.info("Vault: nota guardada en %s/%s", folder, filename)
         except Exception as e:
             logger.error("Error escribiendo en vault: %s", e)
+
+
+async def update_vault_file(folder: str, filename: str, new_content: str):
+    """Update an existing file in the vault (needs SHA for GitHub API)."""
+    if not GITHUB_TOKEN:
+        return
+    path = f"{folder}/{filename}"
+    url = f"https://api.github.com/repos/{VAULT_REPO}/contents/{path}"
+    async with httpx.AsyncClient() as http:
+        try:
+            resp = await http.get(url, headers=_vault_headers(), timeout=10)
+            if resp.status_code != 200:
+                logger.error("Vault: no se encontro %s", path)
+                return
+            sha = resp.json()["sha"]
+            encoded = base64.b64encode(new_content.encode()).decode()
+            await http.put(url, headers=_vault_headers(), json={
+                "message": f"update: {filename}",
+                "content": encoded,
+                "sha": sha,
+            }, timeout=10)
+            logger.info("Vault: actualizado %s", path)
+        except Exception as e:
+            logger.error("Error actualizando vault: %s", e)
+
+
+async def read_vault_folder(folder: str):
+    """Read all .md files from a vault folder via GitHub API."""
+    if not GITHUB_TOKEN:
+        return []
+    url = f"https://api.github.com/repos/{VAULT_REPO}/contents/{folder}"
+    files = []
+    async with httpx.AsyncClient() as http:
+        try:
+            resp = await http.get(url, headers=_vault_headers(), timeout=10)
+            if resp.status_code != 200:
+                return []
+            for item in resp.json():
+                if not item["name"].endswith(".md") or item["name"] == "README.md":
+                    continue
+                file_resp = await http.get(item["url"], headers=_vault_headers(), timeout=10)
+                if file_resp.status_code == 200:
+                    content = base64.b64decode(file_resp.json()["content"]).decode()
+                    files.append({"name": item["name"], "path": item["path"], "content": content})
+        except Exception as e:
+            logger.error("Error leyendo vault/%s: %s", folder, e)
+    return files
+
+
+def parse_frontmatter(content: str):
+    """Parse YAML frontmatter from a markdown file."""
+    if not content.startswith("---"):
+        return {}, content
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        return {}, content
+    meta = {}
+    for line in parts[1].strip().split("\n"):
+        if ":" in line:
+            key, val = line.split(":", 1)
+            meta[key.strip()] = val.strip().strip('"').strip("'")
+    return meta, parts[2].strip()
 
 
 async def process_message(phone, text):
@@ -531,22 +611,26 @@ async def process_message(phone, text):
             msg = msg + "\n\n" + response_text
         await send_whatsapp(phone, msg)
         fecha = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
+        cat = data.get("category", "general")
         md = (
             "---\n"
             "fecha: " + datetime.now(tz).strftime("%Y-%m-%d") + "\n"
             "tipo: tarea\n"
+            "titulo: " + data.get("title", "") + "\n"
             "prioridad: " + data.get("priority", "media") + "\n"
-            "proyecto: " + data.get("category", "general") + "\n"
+            "proyecto: " + cat + "\n"
+            "estado: pendiente\n"
+            + ("descripcion: " + data.get("description", "") + "\n" if data.get("description") else "")
             + ("vence: " + data["due_date"] + "\n" if data.get("due_date") else "") +
-            "procesado: false\n"
             "---\n\n"
             "# " + data.get("title", "") + "\n\n"
             + (data.get("description", "") + "\n\n" if data.get("description") else "") +
             "---\n"
             "*Capturado desde WhatsApp el " + fecha + "*\n"
         )
+        folder = TASK_FOLDER.get(cat, "tareas")
         fname = datetime.now(tz).strftime("%Y-%m-%d-%H%M") + "-tarea-" + str(tid) + ".md"
-        await push_to_vault(md, "inbox", fname)
+        await push_to_vault(md, folder, fname)
 
     elif intent == "idea":
         iid = add_idea(data)
@@ -555,20 +639,21 @@ async def process_message(phone, text):
             msg = msg + "\n\n" + response_text
         await send_whatsapp(phone, msg)
         fecha = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
+        cat = data.get("category", "general")
         md = (
             "---\n"
             "fecha: " + datetime.now(tz).strftime("%Y-%m-%d") + "\n"
             "tipo: idea\n"
-            "proyecto: " + data.get("category", "general") + "\n"
-            "procesado: false\n"
+            "proyecto: " + cat + "\n"
             "---\n\n"
             "# " + data.get("content", "")[:60] + "\n\n"
             + data.get("content", "") + "\n\n"
             "---\n"
             "*Capturado desde WhatsApp el " + fecha + "*\n"
         )
+        folder = IDEA_FOLDER.get(cat, "inbox")
         fname = datetime.now(tz).strftime("%Y-%m-%d-%H%M") + "-idea-" + str(iid) + ".md"
-        await push_to_vault(md, "inbox", fname)
+        await push_to_vault(md, folder, fname)
 
     elif intent == "reminder":
         rid = add_reminder(data)
@@ -576,6 +661,20 @@ async def process_message(phone, text):
         if response_text:
             msg = msg + "\n\n" + response_text
         await send_whatsapp(phone, msg)
+        fecha = datetime.now(tz).strftime("%Y-%m-%d")
+        md = (
+            "---\n"
+            "fecha: " + fecha + "\n"
+            "tipo: recordatorio\n"
+            "mensaje: " + data.get("message", "") + "\n"
+            "recordar_en: " + data.get("remind_at", "") + "\n"
+            "enviado: false\n"
+            "---\n\n"
+            "# " + data.get("message", "") + "\n\n"
+            "Recordar el " + data.get("remind_at", "") + "\n"
+        )
+        fname = datetime.now(tz).strftime("%Y-%m-%d-%H%M") + "-recordatorio-" + str(rid) + ".md"
+        await push_to_vault(md, "recordatorios", fname)
 
     elif intent == "query":
         qt = data.get("query_type", "pending_tasks")
@@ -604,6 +703,19 @@ async def process_message(phone, text):
             if response_text:
                 msg = msg + "\n\n" + response_text
             await send_whatsapp(phone, msg)
+            # Update the task file in Obsidian — search across all task folders
+            for folder in ["tareas", "proyectos/los-lagos", "proyectos/yave"]:
+                vault_files = await read_vault_folder(folder)
+                for vf in vault_files:
+                    meta, body = parse_frontmatter(vf["content"])
+                    if meta.get("tipo") == "tarea" and meta.get("titulo", "").lower() == found.lower():
+                        updated = vf["content"].replace(
+                            "estado: pendiente", "estado: completada"
+                        )
+                        completado_line = "completado: " + datetime.now(tz).strftime("%Y-%m-%d") + "\n"
+                        updated = updated.replace("---\n\n# ", completado_line + "---\n\n# ", 1)
+                        await update_vault_file(folder, vf["name"], updated)
+                        break
         else:
             await send_whatsapp(phone, "\U0001f50d No encontre esa tarea. Escribe *pendientes* para ver la lista.")
 
@@ -613,11 +725,110 @@ async def process_message(phone, text):
         if key and value:
             set_context(key, value)
             await send_whatsapp(phone, "\U0001f9e0 Listo, me lo guarde.\n\n" + response_text)
+            fecha = datetime.now(tz).strftime("%Y-%m-%d")
+            md = (
+                "---\n"
+                "fecha: " + fecha + "\n"
+                "tipo: contexto\n"
+                "clave: " + key + "\n"
+                "valor: " + value + "\n"
+                "---\n\n"
+                "# " + key + "\n\n"
+                + value + "\n"
+            )
+            safe_key = key.lower().replace(" ", "-").replace("/", "-")[:40]
+            fname = "contexto-" + safe_key + ".md"
+            await push_to_vault(md, "contexto", fname)
         else:
             await send_whatsapp(phone, response_text)
 
     else:
         await send_whatsapp(phone, response_text)
+
+
+async def sync_vault_to_db():
+    """Read the vault from GitHub and populate SQLite on startup."""
+    logger.info("Sincronizando vault → SQLite...")
+
+    # Sync tasks from tareas/ and proyectos/
+    task_folders = ["tareas", "proyectos/los-lagos", "proyectos/yave"]
+    for folder in task_folders:
+        files = await read_vault_folder(folder)
+        for f in files:
+            meta, body = parse_frontmatter(f["content"])
+            if meta.get("tipo") != "tarea":
+                continue
+            with get_db() as conn:
+                existing = conn.execute(
+                    "SELECT id FROM tasks WHERE title=? AND created_at LIKE ?",
+                    (meta.get("titulo", ""), meta.get("fecha", "") + "%")
+                ).fetchone()
+                if not existing:
+                    conn.execute(
+                        "INSERT INTO tasks (title,description,priority,category,due_date,status,created_at) "
+                        "VALUES (?,?,?,?,?,?,?)",
+                        (meta.get("titulo", ""),
+                         meta.get("descripcion"),
+                         meta.get("prioridad", "media"),
+                         meta.get("proyecto", "general"),
+                         meta.get("vence"),
+                         meta.get("estado", "pendiente"),
+                         meta.get("fecha", ""))
+                    )
+
+    # Sync ideas from inbox/ and proyectos/
+    idea_folders = ["inbox", "proyectos/los-lagos", "proyectos/yave"]
+    for folder in idea_folders:
+        files = await read_vault_folder(folder)
+        for f in files:
+            meta, body = parse_frontmatter(f["content"])
+            if meta.get("tipo") != "idea":
+                continue
+            with get_db() as conn:
+                existing = conn.execute(
+                    "SELECT id FROM ideas WHERE content=?", (body.split("\n")[0],)
+                ).fetchone()
+                if not existing:
+                    conn.execute(
+                        "INSERT INTO ideas (content,category,tags,created_at) VALUES (?,?,?,?)",
+                        (body.split("\n")[0],
+                         meta.get("proyecto", "general"),
+                         "[]",
+                         meta.get("fecha", ""))
+                    )
+
+    # Sync reminders
+    files = await read_vault_folder("recordatorios")
+    for f in files:
+        meta, body = parse_frontmatter(f["content"])
+        if meta.get("tipo") != "recordatorio":
+            continue
+        with get_db() as conn:
+            existing = conn.execute(
+                "SELECT id FROM reminders WHERE message=?", (meta.get("mensaje", ""),)
+            ).fetchone()
+            if not existing:
+                conn.execute(
+                    "INSERT INTO reminders (message,remind_at,sent) VALUES (?,?,?)",
+                    (meta.get("mensaje", ""),
+                     meta.get("recordar_en", ""),
+                     1 if meta.get("enviado") == "true" else 0)
+                )
+
+    # Sync context
+    files = await read_vault_folder("contexto")
+    for f in files:
+        if f["name"] == "README.md":
+            continue
+        meta, body = parse_frontmatter(f["content"])
+        if meta.get("tipo") != "contexto":
+            continue
+        key = meta.get("clave", "")
+        value = meta.get("valor", body.strip())
+        if key:
+            set_context(key, value)
+
+    logger.info("Vault sincronizado con SQLite.")
 
 
 scheduler = AsyncIOScheduler(timezone=TIMEZONE)
@@ -671,6 +882,7 @@ app = FastAPI(title="Asistente Personal WhatsApp v2")
 @app.on_event("startup")
 async def startup():
     init_db()
+    await sync_vault_to_db()
     scheduler.add_job(check_reminders, IntervalTrigger(minutes=1), id="reminders")
     scheduler.add_job(morning_summary, CronTrigger(hour=7, minute=0), id="morning")
     scheduler.add_job(evening_review, CronTrigger(hour=21, minute=0), id="evening")
