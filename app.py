@@ -13,6 +13,8 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from openai import OpenAI
 
+import gcal
+
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")
 WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID", "653078644555574")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "mi_asistente_personal_2024")
@@ -69,6 +71,11 @@ def init_db():
         "role TEXT NOT NULL,"
         "content TEXT NOT NULL,"
         "created_at TEXT DEFAULT (datetime('now')));"
+        "CREATE TABLE IF NOT EXISTS calendar_notifications_sent ("
+        "event_id TEXT,"
+        "notification_type TEXT,"
+        "sent_at TEXT DEFAULT (datetime('now')),"
+        "PRIMARY KEY (event_id, notification_type));"
     )
     conn.commit()
 
@@ -187,6 +194,7 @@ def build_system_prompt():
         '- query: cuando PREGUNTA por sus cosas (detecta: "que tengo", "pendientes", "resumen", "como voy", "mis tareas")\n'
         '- complete: cuando COMPLETO algo (detecta: "listo", "hecho", "ya hice", "termine")\n'
         '- learn: cuando te ENSENA algo sobre el o sus proyectos (detecta: "recuerda que", "mi prioridad es", "ten en cuenta", "aprende que", "esto es importante")\n'
+        '- agendar_evento: cuando quiere AGENDAR algo en su CALENDARIO de Google (detecta: "agendame", "agrega al calendario", "pon una reunion", "tengo una cita", "reserva X dia"). Distinto de reminder: agendar_evento crea evento en Google Calendar; reminder es solo un mensaje.\n'
         '- chat: conversacion normal, consejo, ayuda para pensar\n\n'
 
         "DATA POR INTENT:\n"
@@ -196,6 +204,7 @@ def build_system_prompt():
         'query: {"query_type":"pending_tasks|ideas|today|overdue|category","category":"opcional"}\n'
         'complete: {"search_term":"texto para buscar la tarea"}\n'
         'learn: {"key":"tema corto","value":"lo que debe recordar"}\n'
+        'agendar_evento: {"title":"corto","start_date":"YYYY-MM-DD","start_time":"HH:MM","duration_minutes":60,"description":"opcional o null"}\n'
         'chat: {}\n\n'
 
         "REGLAS DE PRIORIDAD:\n"
@@ -411,6 +420,24 @@ def mark_reminder_sent(rid):
     conn.commit()
 
 
+def is_calendar_notification_sent(event_id, notif_type):
+    conn = get_db()
+    row = conn.execute(
+        "SELECT 1 FROM calendar_notifications_sent WHERE event_id=? AND notification_type=?",
+        (event_id, notif_type)
+    ).fetchone()
+    return row is not None
+
+
+def mark_calendar_notification_sent(event_id, notif_type):
+    conn = get_db()
+    conn.execute(
+        "INSERT OR IGNORE INTO calendar_notifications_sent (event_id, notification_type) VALUES (?, ?)",
+        (event_id, notif_type)
+    )
+    conn.commit()
+
+
 P_EMOJI = {"alta": "\U0001f534", "media": "\U0001f7e1", "baja": "\U0001f7e2"}
 C_EMOJI = {"yave": "\U0001f916", "loslagos": "\U0001f3e1", "personal": "\U0001f464", "general": "\U0001f4cc"}
 
@@ -587,6 +614,30 @@ async def process_message(phone, text):
         else:
             await send_whatsapp(phone, response_text)
 
+    elif intent == "agendar_evento":
+        if not gcal.is_configured():
+            await send_whatsapp(phone, "Google Calendar no esta configurado todavia.")
+        else:
+            title = data.get("title", "")
+            start_date = data.get("start_date", "")
+            start_time = data.get("start_time", "")
+            duration_min = data.get("duration_minutes") or 60
+            description = data.get("description")
+            if not title or not start_date or not start_time:
+                await send_whatsapp(phone, "No entendi bien la fecha/hora del evento. Reformulalo?")
+            else:
+                try:
+                    start_dt = datetime.strptime(start_date + " " + start_time, "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+                    end_dt = start_dt + timedelta(minutes=int(duration_min))
+                    event = gcal.create_event(title, start_dt.isoformat(), end_dt.isoformat(), description)
+                    if event:
+                        await send_whatsapp(phone, gcal.format_event_for_creation(event))
+                    else:
+                        await send_whatsapp(phone, "Hubo un error creando el evento. Intenta de nuevo.")
+                except Exception as e:
+                    logger.error("Error procesando agendar_evento: %s", e)
+                    await send_whatsapp(phone, "Hubo un error con la fecha/hora. Intenta de nuevo.")
+
     else:
         await send_whatsapp(phone, response_text)
 
@@ -636,6 +687,33 @@ async def evening_review():
     await send_whatsapp(MY_PHONE_NUMBER, msg)
 
 
+async def check_calendar_events():
+    if not gcal.is_configured() or not MY_PHONE_NUMBER:
+        return
+    events = gcal.list_upcoming_events(minutes_ahead=35)
+    now = datetime.now(tz)
+    for event in events:
+        event_id = event.get("id", "")
+        if not event_id:
+            continue
+        start_str = event.get("start", {}).get("dateTime", "")
+        try:
+            start_dt = datetime.fromisoformat(start_str)
+        except Exception:
+            continue
+        delta_min = (start_dt - now).total_seconds() / 60
+
+        if 25 <= delta_min <= 30 and not is_calendar_notification_sent(event_id, "T-30"):
+            await send_whatsapp(MY_PHONE_NUMBER, gcal.format_event_for_reminder(event, "T-30"))
+            mark_calendar_notification_sent(event_id, "T-30")
+        if 10 <= delta_min <= 15 and not is_calendar_notification_sent(event_id, "T-15"):
+            await send_whatsapp(MY_PHONE_NUMBER, gcal.format_event_for_reminder(event, "T-15"))
+            mark_calendar_notification_sent(event_id, "T-15")
+        if -5 <= delta_min <= 1 and not is_calendar_notification_sent(event_id, "T-0"):
+            await send_whatsapp(MY_PHONE_NUMBER, gcal.format_event_for_reminder(event, "T-0"))
+            mark_calendar_notification_sent(event_id, "T-0")
+
+
 app = FastAPI(title="Asistente Personal WhatsApp v3")
 
 
@@ -645,6 +723,11 @@ async def startup():
     scheduler.add_job(check_reminders, IntervalTrigger(minutes=1), id="reminders")
     scheduler.add_job(morning_summary, CronTrigger(hour=7, minute=0), id="morning")
     scheduler.add_job(evening_review, CronTrigger(hour=21, minute=0), id="evening")
+    if gcal.is_configured():
+        scheduler.add_job(check_calendar_events, IntervalTrigger(minutes=5), id="gcal")
+        logger.info("Google Calendar: configurado")
+    else:
+        logger.warning("Google Calendar: NO configurado (faltan env vars GOOGLE_*)")
     scheduler.start()
     logger.info("Asistente Personal v3 iniciado - Turso DB")
 
