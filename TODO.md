@@ -1,6 +1,6 @@
 # TODO
 
-Items fuera del scope de la integracion inicial de Google Calendar (mayo 2026).
+Items fuera del scope inmediato (mayo 2026).
 
 ## Calendar — proximas iteraciones
 

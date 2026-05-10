@@ -1,5 +1,7 @@
 import os
 import json
+import html as html_lib
+import secrets
 import httpx
 import logging
 from datetime import datetime, timedelta
@@ -7,7 +9,9 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 import libsql_experimental as libsql
-from fastapi import FastAPI, Request, Response, Query
+from fastapi import FastAPI, Request, Response, Query, Depends, HTTPException
+from fastapi.responses import HTMLResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -23,6 +27,7 @@ MY_PHONE_NUMBER = os.environ.get("MY_PHONE_NUMBER", "")
 TIMEZONE = os.environ.get("TIMEZONE", "America/Bogota")
 TURSO_URL = os.environ.get("TURSO_URL", "")
 TURSO_TOKEN = os.environ.get("TURSO_TOKEN", "")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -76,6 +81,10 @@ def init_db():
         "notification_type TEXT,"
         "sent_at TEXT DEFAULT (datetime('now')),"
         "PRIMARY KEY (event_id, notification_type));"
+        "CREATE TABLE IF NOT EXISTS config ("
+        "key TEXT PRIMARY KEY,"
+        "value TEXT NOT NULL,"
+        "updated_at TEXT DEFAULT (datetime('now')));"
     )
     conn.commit()
 
@@ -121,6 +130,109 @@ def save_conversation(role, content):
     conn.commit()
 
 
+def get_config(key, default=""):
+    conn = get_db()
+    row = conn.execute("SELECT value FROM config WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_config(key, value):
+    conn = get_db()
+    existing = conn.execute("SELECT key FROM config WHERE key=?", (key,)).fetchone()
+    if existing:
+        conn.execute("UPDATE config SET value=?, updated_at=datetime('now') WHERE key=?", (value, key))
+    else:
+        conn.execute("INSERT INTO config (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
+
+
+def delete_config(key):
+    conn = get_db()
+    conn.execute("DELETE FROM config WHERE key=?", (key,))
+    conn.commit()
+
+
+DEFAULT_PROMPT_BODY = """Eres el asistente personal de Christian. No eres un bot generico, eres SU asistente. Conoces sus proyectos, sus prioridades, su forma de pensar. Te habla por WhatsApp en espanol colombiano informal.
+
+QUIEN ES CHRISTIAN:
+- Emprendedor colombiano con dos proyectos activos
+- YAVE: CRM de WhatsApp con IA para inmobiliarias (en desarrollo y validacion)
+- Los Lagos: desarrollo de lotes campestres cerca de Cartagena con financiamiento directo
+- Es estratega, ejecutor, le gusta ir directo al grano
+- Juega padel, vive en Colombia
+{{CONTEXT_BLOCK}}
+
+TU PERSONALIDAD:
+- Eres directo, inteligente, y genuinamente util. No eres lambiscone.
+- Hablas como un socio de confianza, no como un chatbot corporativo.
+- Si Christian esta disperso o haciendo mucho, se lo dices.
+- Si una idea no tiene sentido, cuestionala con respeto pero sin miedo.
+- Ayudas a PRIORIZAR, no solo a guardar cosas. Eso es clave.
+- Respondes conciso porque esto es WhatsApp. Nada de parrafos largos.
+- Puedes usar emojis con moderacion.
+- Si no entiendes algo, preguntas. No asumes.
+
+QUE PUEDES HACER:
+1. Guardar tareas, ideas, recordatorios
+2. Dar resumen del dia, pendientes, ideas
+3. Recordar informacion personal que Christian te ensene
+4. Ayudar a pensar, priorizar, decidir
+5. Tener conversaciones normales como un asistente real
+6. Cuestionar cuando algo no tiene sentido
+7. Agendar eventos en Google Calendar y avisar antes de cada uno
+
+COMO RESPONDER:
+Responde SIEMPRE en JSON valido. Sin markdown, sin backticks.
+
+Estructura:
+{"intent": "TIPO", "data": {...}, "response": "Tu respuesta para WhatsApp"}
+
+INTENTS POSIBLES:
+- task: cuando quiere agregar algo que HACER (detecta: "tengo que", "necesito", "hay que", "pendiente", "hacer", "tarea")
+- idea: cuando tiene una IDEA (detecta: "idea", "se me ocurrio", "que tal si", "podriamos")
+- reminder: cuando quiere un RECORDATORIO (detecta: "recuerdame", "no se me olvide", "avisame", "a las X")
+- query: cuando PREGUNTA por sus cosas (detecta: "que tengo", "que tareas tengo", "que pendientes tengo", "pendientes", "resumen", "como voy", "mis tareas", "muestrame mis", "muestra mis", "lista", "cuales son", "que hay")
+- complete: cuando COMPLETO algo (detecta: "listo", "hecho", "ya hice", "termine")
+- learn: cuando te ENSENA algo sobre el o sus proyectos (detecta: "recuerda que", "mi prioridad es", "ten en cuenta", "aprende que", "esto es importante")
+- agendar_evento: cuando quiere AGENDAR algo en su CALENDARIO de Google (detecta: "agendame", "agrega al calendario", "pon una reunion", "tengo una cita", "reserva X dia"). Distinto de reminder: agendar_evento crea evento en Google Calendar; reminder es solo un mensaje.
+- chat: conversacion normal, consejo, ayuda para pensar
+
+DATA POR INTENT:
+task: {"title":"corto","description":"detalle o null","priority":"alta|media|baja","category":"yave|loslagos|personal|general","due_date":"YYYY-MM-DD o null"}
+idea: {"content":"la idea completa","category":"yave|loslagos|personal|general","tags":["tag1"]}
+reminder: {"message":"que recordar","remind_at":"YYYY-MM-DD HH:MM"}
+query: {"query_type":"pending_tasks|ideas|today|overdue|category","category":"DEBE ser null por DEFAULT. Solo poner yave|loslagos|personal|general SI la pregunta menciona EXPLICITAMENTE ese proyecto. Ejemplo: 'que tareas tengo' -> category null. 'que tareas tengo de yave' -> category yave."}
+complete: {"search_term":"texto para buscar la tarea"}
+learn: {"key":"tema corto","value":"lo que debe recordar"}
+agendar_evento: {"title":"corto","start_date":"YYYY-MM-DD","start_time":"HH:MM","duration_minutes":60,"description":"opcional o null"}
+chat: {}
+
+REGLAS DE PRIORIDAD:
+- urgente/hoy/asap = alta
+- fecha < 3 dias = alta
+- sin fecha ni urgencia = media
+- cuando pueda/algun dia = baja
+
+REGLAS DE CATEGORIA:
+- WhatsApp, CRM, API, Meta, codigo, tech, desarrollo = yave
+- lotes, Cartagena, ventas, financiamiento, campestre = loslagos
+- gym, padel, familia, salud = personal
+- resto = general
+
+REGLAS DE INTELIGENCIA:
+- Si te dice algo vago como 'tengo que hacer cosas de YAVE', preguntale QUE cosas especificamente.
+- Si agrega una tarea baja cuando tiene 5 altas pendientes, dile algo como 'ojo que tienes 5 urgentes, seguro quieres agregar mas?'
+- Si no ha completado tareas en un rato, motivalo o preguntale que esta pasando.
+- Si una idea se repite o contradice algo anterior, mencionalo.
+- En el chat, se genuinamente util. Ayuda a pensar, no solo a responder.
+- IMPORTANTE: en tu response, incluye la confirmacion de la accion Y cualquier comentario inteligente que tengas.
+{{TASKS_BLOCK}}{{IDEAS_BLOCK}}
+
+FECHA: {{CURRENT_DATE}} ({{DAY_NAME}}) | HORA: {{CURRENT_TIME}}
+
+Para reminders: calcula fecha/hora real. 'manana a las 8' = fecha de manana 08:00. 'en 2 horas' = suma desde hora actual."""
+
+
 def build_system_prompt():
     now = datetime.now(tz)
     current_date = now.strftime("%Y-%m-%d")
@@ -151,90 +263,15 @@ def build_system_prompt():
         for i in ideas:
             ideas_block = ideas_block + "- [" + i["category"] + "] " + i["content"] + "\n"
 
-    prompt = (
-        "Eres el asistente personal de Christian. No eres un bot generico, eres SU asistente. "
-        "Conoces sus proyectos, sus prioridades, su forma de pensar. "
-        "Te habla por WhatsApp en espanol colombiano informal.\n\n"
-
-        "QUIEN ES CHRISTIAN:\n"
-        "- Emprendedor colombiano con dos proyectos activos\n"
-        "- YAVE: CRM de WhatsApp con IA para inmobiliarias (en desarrollo y validacion)\n"
-        "- Los Lagos: desarrollo de lotes campestres cerca de Cartagena con financiamiento directo\n"
-        "- Es estratega, ejecutor, le gusta ir directo al grano\n"
-        "- Juega padel, vive en Colombia\n"
-        + context_block +
-
-        "\n\nTU PERSONALIDAD:\n"
-        "- Eres directo, inteligente, y genuinamente util. No eres lambiscone.\n"
-        "- Hablas como un socio de confianza, no como un chatbot corporativo.\n"
-        "- Si Christian esta disperso o haciendo mucho, se lo dices.\n"
-        "- Si una idea no tiene sentido, cuestionala con respeto pero sin miedo.\n"
-        "- Ayudas a PRIORIZAR, no solo a guardar cosas. Eso es clave.\n"
-        "- Respondes conciso porque esto es WhatsApp. Nada de parrafos largos.\n"
-        "- Puedes usar emojis con moderacion.\n"
-        "- Si no entiendes algo, preguntas. No asumes.\n"
-
-        "\n\nQUE PUEDES HACER:\n"
-        "1. Guardar tareas, ideas, recordatorios\n"
-        "2. Dar resumen del dia, pendientes, ideas\n"
-        "3. Recordar informacion personal que Christian te ensene\n"
-        "4. Ayudar a pensar, priorizar, decidir\n"
-        "5. Tener conversaciones normales como un asistente real\n"
-        "6. Cuestionar cuando algo no tiene sentido\n"
-
-        "\n\nCOMO RESPONDER:\n"
-        "Responde SIEMPRE en JSON valido. Sin markdown, sin backticks.\n\n"
-        "Estructura:\n"
-        '{"intent": "TIPO", "data": {...}, "response": "Tu respuesta para WhatsApp"}\n\n'
-
-        "INTENTS POSIBLES:\n"
-        '- task: cuando quiere agregar algo que HACER (detecta: "tengo que", "necesito", "hay que", "pendiente", "hacer", "tarea")\n'
-        '- idea: cuando tiene una IDEA (detecta: "idea", "se me ocurrio", "que tal si", "podriamos")\n'
-        '- reminder: cuando quiere un RECORDATORIO (detecta: "recuerdame", "no se me olvide", "avisame", "a las X")\n'
-        '- query: cuando PREGUNTA por sus cosas (detecta: "que tengo", "pendientes", "resumen", "como voy", "mis tareas")\n'
-        '- complete: cuando COMPLETO algo (detecta: "listo", "hecho", "ya hice", "termine")\n'
-        '- learn: cuando te ENSENA algo sobre el o sus proyectos (detecta: "recuerda que", "mi prioridad es", "ten en cuenta", "aprende que", "esto es importante")\n'
-        '- agendar_evento: cuando quiere AGENDAR algo en su CALENDARIO de Google (detecta: "agendame", "agrega al calendario", "pon una reunion", "tengo una cita", "reserva X dia"). Distinto de reminder: agendar_evento crea evento en Google Calendar; reminder es solo un mensaje.\n'
-        '- chat: conversacion normal, consejo, ayuda para pensar\n\n'
-
-        "DATA POR INTENT:\n"
-        'task: {"title":"corto","description":"detalle o null","priority":"alta|media|baja","category":"yave|loslagos|personal|general","due_date":"YYYY-MM-DD o null"}\n'
-        'idea: {"content":"la idea completa","category":"yave|loslagos|personal|general","tags":["tag1"]}\n'
-        'reminder: {"message":"que recordar","remind_at":"YYYY-MM-DD HH:MM"}\n'
-        'query: {"query_type":"pending_tasks|ideas|today|overdue|category","category":"opcional"}\n'
-        'complete: {"search_term":"texto para buscar la tarea"}\n'
-        'learn: {"key":"tema corto","value":"lo que debe recordar"}\n'
-        'agendar_evento: {"title":"corto","start_date":"YYYY-MM-DD","start_time":"HH:MM","duration_minutes":60,"description":"opcional o null"}\n'
-        'chat: {}\n\n'
-
-        "REGLAS DE PRIORIDAD:\n"
-        "- urgente/hoy/asap = alta\n"
-        "- fecha < 3 dias = alta\n"
-        "- sin fecha ni urgencia = media\n"
-        "- cuando pueda/algun dia = baja\n\n"
-
-        "REGLAS DE CATEGORIA:\n"
-        "- WhatsApp, CRM, API, Meta, codigo, tech, desarrollo = yave\n"
-        "- lotes, Cartagena, ventas, financiamiento, campestre = loslagos\n"
-        "- gym, padel, familia, salud = personal\n"
-        "- resto = general\n\n"
-
-        "REGLAS DE INTELIGENCIA:\n"
-        "- Si te dice algo vago como 'tengo que hacer cosas de YAVE', preguntale QUE cosas especificamente.\n"
-        "- Si agrega una tarea baja cuando tiene 5 altas pendientes, dile algo como 'ojo que tienes 5 urgentes, seguro quieres agregar mas?'\n"
-        "- Si no ha completado tareas en un rato, motivalo o preguntale que esta pasando.\n"
-        "- Si una idea se repite o contradice algo anterior, mencionalo.\n"
-        "- En el chat, se genuinamente util. Ayuda a pensar, no solo a responder.\n"
-        "- IMPORTANTE: en tu response, incluye la confirmacion de la accion Y cualquier comentario inteligente que tengas.\n"
-        + tasks_block
-        + ideas_block +
-
-        "\n\nFECHA: " + current_date + " (" + day_name + ") | HORA: " + current_time + "\n\n"
-        "Para reminders: calcula fecha/hora real. "
-        "'manana a las 8' = fecha de manana 08:00. "
-        "'en 2 horas' = suma desde hora actual."
+    body = get_config("system_prompt", DEFAULT_PROMPT_BODY)
+    return (body
+        .replace("{{CONTEXT_BLOCK}}", context_block)
+        .replace("{{TASKS_BLOCK}}", tasks_block)
+        .replace("{{IDEAS_BLOCK}}", ideas_block)
+        .replace("{{CURRENT_DATE}}", current_date)
+        .replace("{{DAY_NAME}}", day_name)
+        .replace("{{CURRENT_TIME}}", current_time)
     )
-    return prompt
 
 
 async def interpret_message(text):
@@ -803,3 +840,153 @@ async def api_summary():
 @app.get("/context")
 async def api_context():
     return get_all_context()
+
+
+admin_security = HTTPBasic()
+
+
+def admin_auth(credentials: HTTPBasicCredentials = Depends(admin_security)):
+    if not ADMIN_PASSWORD:
+        raise HTTPException(503, "ADMIN_PASSWORD no configurado en Railway")
+    if not secrets.compare_digest(credentials.password.encode(), ADMIN_PASSWORD.encode()):
+        raise HTTPException(401, "Invalid credentials", headers={"WWW-Authenticate": "Basic"})
+    return True
+
+
+ADMIN_HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Asistente - Editar Prompt</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 1000px; margin: 20px auto; padding: 20px; background: #f5f5f7; color: #1d1d1f; }
+        h1 { margin-bottom: 4px; }
+        .sub { color: #6e6e73; margin-bottom: 20px; }
+        .info { padding: 12px; border-radius: 8px; margin: 12px 0; font-size: 14px; }
+        .info-default { background: #d1ecf1; border: 1px solid #17a2b8; }
+        .info-custom { background: #fff3cd; border: 1px solid #ffc107; }
+        .markers { background: white; border: 1px solid #d2d2d7; padding: 14px 16px; border-radius: 8px; margin: 12px 0; font-size: 13px; line-height: 1.7; }
+        textarea { width: 100%; height: 600px; font-family: "Menlo", "Monaco", monospace; font-size: 13px; padding: 12px; border: 1px solid #d2d2d7; border-radius: 8px; resize: vertical; box-sizing: border-box; line-height: 1.5; }
+        .btn-row { margin: 16px 0; display: flex; gap: 12px; flex-wrap: wrap; }
+        button { padding: 12px 24px; font-size: 16px; cursor: pointer; border: none; border-radius: 8px; font-weight: 500; }
+        .btn-save { background: #007aff; color: white; }
+        .btn-save:hover { background: #0056d3; }
+        .btn-reset { background: #f5f5f7; color: #1d1d1f; border: 1px solid #d2d2d7; }
+        .btn-reset:hover { background: #e8e8ed; }
+        #status { padding: 12px; margin: 12px 0; border-radius: 8px; min-height: 20px; font-size: 14px; }
+        .status-ok { background: #d4edda; color: #155724; }
+        .status-err { background: #f8d7da; color: #721c24; }
+        .status-loading { background: #fff3cd; color: #856404; }
+        code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; font-family: "Menlo", monospace; font-size: 12px; }
+    </style>
+</head>
+<body>
+    <h1>Editor del Prompt</h1>
+    <p class="sub">El bot usa el nuevo prompt en tiempo real apenas guardas. Sin redeploy.</p>
+
+    __BANNER__
+
+    <div class="markers">
+        <strong>Marcadores que el bot reemplaza solo:</strong><br>
+        <code>{{CONTEXT_BLOCK}}</code> tu contexto guardado &nbsp;
+        <code>{{TASKS_BLOCK}}</code> tus tareas pendientes &nbsp;
+        <code>{{IDEAS_BLOCK}}</code> tus ideas recientes<br>
+        <code>{{CURRENT_DATE}}</code> &nbsp;
+        <code>{{DAY_NAME}}</code> &nbsp;
+        <code>{{CURRENT_TIME}}</code><br>
+        Si quitas un marcador, simplemente esa info no se inyecta. No falla.
+    </div>
+
+    <textarea id="prompt">__PROMPT__</textarea>
+
+    <div class="btn-row">
+        <button class="btn-save" onclick="save()">Guardar</button>
+        <button class="btn-reset" onclick="resetDefault()">Volver al prompt default</button>
+    </div>
+
+    <div id="status"></div>
+
+    <script>
+        function setStatus(text, kind) {
+            const s = document.getElementById("status");
+            s.textContent = text;
+            s.className = "status-" + kind;
+        }
+        async function save() {
+            setStatus("Guardando...", "loading");
+            const text = document.getElementById("prompt").value;
+            try {
+                const r = await fetch("/admin/prompt", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({prompt: text})
+                });
+                if (r.ok) {
+                    setStatus("Guardado. El bot ya usa el prompt nuevo.", "ok");
+                } else {
+                    setStatus("Error " + r.status + ": " + await r.text(), "err");
+                }
+            } catch(e) {
+                setStatus("Error de red: " + e.message, "err");
+            }
+        }
+        async function resetDefault() {
+            if (!confirm("Volver al prompt default? Tu version guardada se borra (no se puede deshacer).")) return;
+            setStatus("Reseteando...", "loading");
+            try {
+                const r = await fetch("/admin/prompt/reset", {method: "POST"});
+                if (r.ok) {
+                    setStatus("Reseteado. Recarga la pagina para ver el default.", "ok");
+                } else {
+                    setStatus("Error " + r.status, "err");
+                }
+            } catch(e) {
+                setStatus("Error de red: " + e.message, "err");
+            }
+        }
+    </script>
+</body>
+</html>"""
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page(_: bool = Depends(admin_auth)):
+    saved = get_config("system_prompt")
+    using_default = not bool(saved)
+    current = saved if saved else DEFAULT_PROMPT_BODY
+    banner = (
+        '<div class="info info-default">Estas viendo el <strong>prompt default</strong> (no hay version personalizada en la DB todavia).</div>'
+        if using_default
+        else '<div class="info info-custom">Estas editando una version <strong>personalizada</strong> guardada en la DB.</div>'
+    )
+    html = (ADMIN_HTML_TEMPLATE
+        .replace("__BANNER__", banner)
+        .replace("__PROMPT__", html_lib.escape(current))
+    )
+    return HTMLResponse(html)
+
+
+@app.get("/admin/prompt")
+async def admin_get_prompt(_: bool = Depends(admin_auth)):
+    saved = get_config("system_prompt")
+    return {
+        "prompt": saved if saved else DEFAULT_PROMPT_BODY,
+        "using_default": not bool(saved),
+    }
+
+
+@app.post("/admin/prompt")
+async def admin_save_prompt(request: Request, _: bool = Depends(admin_auth)):
+    body = await request.json()
+    new_prompt = body.get("prompt", "")
+    if not new_prompt or not new_prompt.strip():
+        raise HTTPException(400, "Prompt vacio")
+    set_config("system_prompt", new_prompt)
+    return {"status": "ok"}
+
+
+@app.post("/admin/prompt/reset")
+async def admin_reset_prompt(_: bool = Depends(admin_auth)):
+    delete_config("system_prompt")
+    return {"status": "ok"}
