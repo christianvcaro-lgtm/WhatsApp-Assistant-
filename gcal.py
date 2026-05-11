@@ -77,6 +77,69 @@ def list_upcoming_events(minutes_ahead: int = 35) -> list:
         return []
 
 
+def list_events_next_hours(hours_ahead: int = 24) -> list:
+    service = get_calendar_service()
+    if not service:
+        return []
+    tz = ZoneInfo(GOOGLE_TIMEZONE)
+    now = datetime.now(tz)
+    time_min = now.isoformat()
+    time_max = (now + timedelta(hours=hours_ahead)).isoformat()
+    try:
+        result = service.events().list(
+            calendarId=GOOGLE_CALENDAR_ID,
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=30,
+        ).execute()
+        events = result.get("items", [])
+        return [e for e in events if "dateTime" in e.get("start", {})]
+    except HttpError as e:
+        logger.error("gcal list_next_hours error: %s", e)
+        return []
+    except Exception as e:
+        logger.error("gcal list_next_hours unexpected error: %s", e)
+        return []
+
+
+def is_event_active_now() -> bool:
+    service = get_calendar_service()
+    if not service:
+        return False
+    tz = ZoneInfo(GOOGLE_TIMEZONE)
+    now = datetime.now(tz)
+    time_min = (now - timedelta(hours=2)).isoformat()
+    time_max = now.isoformat()
+    try:
+        result = service.events().list(
+            calendarId=GOOGLE_CALENDAR_ID,
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=10,
+        ).execute()
+        events = result.get("items", [])
+        for e in events:
+            start = e.get("start", {}).get("dateTime", "")
+            end = e.get("end", {}).get("dateTime", "")
+            if not start or not end:
+                continue
+            try:
+                start_dt = datetime.fromisoformat(start)
+                end_dt = datetime.fromisoformat(end)
+            except Exception:
+                continue
+            if start_dt <= now <= end_dt:
+                return True
+        return False
+    except Exception as e:
+        logger.error("gcal is_event_active_now error: %s", e)
+        return False
+
+
 def create_event(
     title: str,
     start_iso: str,
@@ -133,14 +196,20 @@ def format_event_for_reminder(event: dict, notification_type: str) -> str:
     except Exception:
         time_str = ""
 
-    if notification_type == "T-30":
-        msg = "⏰ En 30 min: *" + title + "*"
-        if time_str:
-            msg = msg + " (" + time_str + ")"
-    elif notification_type == "T-15":
-        msg = "⏰ En 15 min: *" + title + "*"
-    elif notification_type == "T-0":
+    minutes = None
+    if notification_type.startswith("T-"):
+        try:
+            minutes = int(notification_type[2:])
+        except ValueError:
+            minutes = None
+
+    if minutes == 0:
         msg = "\U0001f680 Empieza ahora: *" + title + "*"
+    elif minutes is not None and minutes > 0:
+        emoji = "\U0001f3c1" if minutes <= 5 else "⏰"
+        msg = emoji + " En " + str(minutes) + " min: *" + title + "*"
+        if time_str and minutes >= 15:
+            msg = msg + " (" + time_str + ")"
     else:
         msg = "Recordatorio: " + title
 
