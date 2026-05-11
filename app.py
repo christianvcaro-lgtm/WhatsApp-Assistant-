@@ -89,6 +89,39 @@ def init_db():
     conn.commit()
 
 
+def _column_exists(conn, table, column):
+    rows = conn.execute("PRAGMA table_info(" + table + ")").fetchall()
+    return any(r[1] == column for r in rows)
+
+
+def migrate_schema():
+    conn = get_db()
+    new_task_columns = [
+        ("nudge_count", "INTEGER DEFAULT 0"),
+        ("last_nudged_at", "TEXT"),
+        ("postpone_count", "INTEGER DEFAULT 0"),
+        ("snoozed_until", "TEXT"),
+        ("source_event_id", "TEXT"),
+    ]
+    for col_name, col_def in new_task_columns:
+        if not _column_exists(conn, "tasks", col_name):
+            conn.execute("ALTER TABLE tasks ADD COLUMN " + col_name + " " + col_def)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS event_followups ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "event_id TEXT NOT NULL,"
+        "event_title TEXT,"
+        "event_end_at TEXT NOT NULL,"
+        "scheduled_at TEXT NOT NULL,"
+        "sent_at TEXT,"
+        "responded_at TEXT,"
+        "status TEXT DEFAULT 'pending',"
+        "outcome TEXT,"
+        "created_at TEXT DEFAULT (datetime('now')))"
+    )
+    conn.commit()
+
+
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 
@@ -152,6 +185,33 @@ def delete_config(key):
     conn.commit()
 
 
+def get_int_config(key, default):
+    raw = get_config(key, "")
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+TIMING_DEFAULTS = {
+    "pre_event_min_1": 30,
+    "pre_event_min_2": 10,
+    "pre_event_min_3": 2,
+    "pre_event_min_4": 0,
+    "post_event_min": 30,
+    "nudge_window_start_hour": 8,
+    "nudge_window_end_hour": 21,
+    "nudge_cap_per_task": 5,
+    "followup_no_response_hours": 4,
+}
+
+
+def get_timing(key):
+    return get_int_config(key, TIMING_DEFAULTS[key])
+
+
 DEFAULT_PROMPT_BODY = """Eres el asistente personal de Christian. No eres un bot generico, eres SU asistente. Conoces sus proyectos, sus prioridades, su forma de pensar. Te habla por WhatsApp en espanol colombiano informal.
 
 QUIEN ES CHRISTIAN:
@@ -193,8 +253,11 @@ INTENTS POSIBLES:
 - reminder: cuando quiere un RECORDATORIO (detecta: "recuerdame", "no se me olvide", "avisame", "a las X")
 - query: cuando PREGUNTA por sus cosas (detecta: "que tengo", "que tareas tengo", "que pendientes tengo", "pendientes", "resumen", "como voy", "mis tareas", "muestrame mis", "muestra mis", "lista", "cuales son", "que hay")
 - complete: cuando COMPLETO algo (detecta: "listo", "hecho", "ya hice", "termine")
+- kill: cuando quiere DESCARTAR una tarea sin haberla hecho (detecta: "olvidalo", "ya no", "matala", "borra eso", "descarta", "cancelala", "quitala"). Marca la tarea como killed sin completarla.
+- postpone: cuando POSTERGA una tarea existente para otro dia (detecta: "lo hago mañana", "el viernes lo veo", "mas tarde", "lo dejo para X dia"). Identifica de cual tarea pendiente esta hablando y calcula la nueva fecha. NO uses postpone para tareas nuevas - solo para mover tareas ya en la lista.
 - learn: cuando te ENSENA algo sobre el o sus proyectos (detecta: "recuerda que", "mi prioridad es", "ten en cuenta", "aprende que", "esto es importante")
 - agendar_evento: cuando quiere AGENDAR algo en su CALENDARIO de Google (detecta: "agendame", "agrega al calendario", "pon una reunion", "tengo una cita", "reserva X dia"). Distinto de reminder: agendar_evento crea evento en Google Calendar; reminder es solo un mensaje.
+- event_followup_response: SOLO cuando en la conversacion reciente TU (asistente) hiciste una pregunta del tipo "Tu reunion X termino hace ~30 min. ¿Se dio? ¿Que quedo pendiente?" y el usuario esta respondiendo a esa pregunta especifica. Detecta outcome (si la reunion ocurrio o no) y extrae los pendientes que menciona.
 - chat: conversacion normal, consejo, ayuda para pensar
 
 DATA POR INTENT:
@@ -203,8 +266,11 @@ idea: {"content":"la idea completa","category":"yave|loslagos|personal|general",
 reminder: {"message":"que recordar","remind_at":"YYYY-MM-DD HH:MM"}
 query: {"query_type":"pending_tasks|ideas|today|overdue|category","category":"DEBE ser null por DEFAULT. Solo poner yave|loslagos|personal|general SI la pregunta menciona EXPLICITAMENTE ese proyecto. Ejemplo: 'que tareas tengo' -> category null. 'que tareas tengo de yave' -> category yave."}
 complete: {"search_term":"texto para buscar la tarea"}
+kill: {"search_term":"texto para buscar la tarea"}
+postpone: {"search_term":"texto para buscar la tarea","new_due_date":"YYYY-MM-DD"}
 learn: {"key":"tema corto","value":"lo que debe recordar"}
 agendar_evento: {"title":"corto","start_date":"YYYY-MM-DD","start_time":"HH:MM","duration_minutes":60,"description":"opcional o null"}
+event_followup_response: {"outcome":"happened|didnt_happen|unknown","pending_tasks":["titulo corto 1","titulo corto 2"]}
 chat: {}
 
 REGLAS DE PRIORIDAD:
@@ -226,7 +292,16 @@ REGLAS DE INTELIGENCIA:
 - Si una idea se repite o contradice algo anterior, mencionalo.
 - En el chat, se genuinamente util. Ayuda a pensar, no solo a responder.
 - IMPORTANTE: en tu response, incluye la confirmacion de la accion Y cualquier comentario inteligente que tengas.
-{{TASKS_BLOCK}}{{IDEAS_BLOCK}}
+
+TONO ADAPTATIVO SEGUN HISTORIAL DE LA TAREA:
+- Si una tarea tiene `nudges: N` con N >= 3, o `pospuesta N v` con N >= 2: NO la trates suave. Confronta con los datos ("ya te la recorde 3 veces", "ya la pospusiste 2 veces"). Pide decision concreta: hacerla ahora con un primer paso de 5 min, replantear con fecha y hora reales, o matarla (intent kill).
+- "Mañana" no es una respuesta valida si ya dijo "mañana" antes. Pide hora concreta.
+- Si Christian dice "lo hago despues / mañana / mas tarde" sobre una tarea existente, eso es postergacion: emite intent postpone, no chat.
+
+CONCIENCIA DE CALENDARIO:
+- Si en EVENTOS PROXIMAS 24H hay un evento empezando en menos de 15 min, considera mencionarlo en tu respuesta o moderar la conversacion ("oye, tienes X en 10 min, esto lo vemos despues?").
+- No agendes tareas o reminders que pisen un evento existente sin avisar.
+{{TASKS_BLOCK}}{{EVENTS_BLOCK}}{{IDEAS_BLOCK}}
 
 FECHA: {{CURRENT_DATE}} ({{DAY_NAME}}) | HORA: {{CURRENT_TIME}}
 
@@ -250,9 +325,24 @@ def build_system_prompt():
     tasks_block = ""
     if tasks:
         tasks_block = "\n\nTAREAS PENDIENTES ACTUALES (" + str(len(tasks)) + "):\n"
+        today = now.date()
         for t in tasks[:10]:
-            due = " [vence: " + t["due_date"] + "]" if t.get("due_date") else ""
-            tasks_block = tasks_block + "- [" + t["priority"] + "] [" + t["category"] + "] " + t["title"] + due + "\n"
+            meta = []
+            if t.get("due_date"):
+                meta.append("vence: " + t["due_date"])
+                try:
+                    d = datetime.strptime(t["due_date"], "%Y-%m-%d").date()
+                    days = (today - d).days
+                    if days > 0:
+                        meta.append("vencida " + str(days) + " d")
+                except Exception:
+                    pass
+            if t.get("nudge_count", 0) > 0:
+                meta.append("nudges: " + str(t["nudge_count"]))
+            if t.get("postpone_count", 0) > 0:
+                meta.append("pospuesta " + str(t["postpone_count"]) + " v")
+            suffix = " [" + ", ".join(meta) + "]" if meta else ""
+            tasks_block = tasks_block + "- [" + t["priority"] + "] [" + t["category"] + "] " + t["title"] + suffix + "\n"
         if len(tasks) > 10:
             tasks_block = tasks_block + "... y " + str(len(tasks) - 10) + " mas\n"
 
@@ -263,11 +353,30 @@ def build_system_prompt():
         for i in ideas:
             ideas_block = ideas_block + "- [" + i["category"] + "] " + i["content"] + "\n"
 
+    events_block = ""
+    if gcal.is_configured():
+        try:
+            upcoming = gcal.list_events_next_hours(24)
+            if upcoming:
+                events_block = "\n\nEVENTOS EN LAS PROXIMAS 24H:\n"
+                for e in upcoming[:8]:
+                    title = e.get("summary", "(sin titulo)")
+                    start = e.get("start", {}).get("dateTime", "")
+                    try:
+                        sdt = datetime.fromisoformat(start)
+                        when = sdt.strftime("%Y-%m-%d %H:%M")
+                    except Exception:
+                        when = start
+                    events_block = events_block + "- " + when + " - " + title + "\n"
+        except Exception as e:
+            logger.error("events_block error: %s", e)
+
     body = get_config("system_prompt", DEFAULT_PROMPT_BODY)
     return (body
         .replace("{{CONTEXT_BLOCK}}", context_block)
         .replace("{{TASKS_BLOCK}}", tasks_block)
         .replace("{{IDEAS_BLOCK}}", ideas_block)
+        .replace("{{EVENTS_BLOCK}}", events_block)
         .replace("{{CURRENT_DATE}}", current_date)
         .replace("{{DAY_NAME}}", day_name)
         .replace("{{CURRENT_TIME}}", current_time)
@@ -309,9 +418,10 @@ async def interpret_message(text):
 def add_task(data):
     conn = get_db()
     conn.execute(
-        "INSERT INTO tasks (title,description,priority,category,due_date) VALUES (?,?,?,?,?)",
+        "INSERT INTO tasks (title,description,priority,category,due_date,source_event_id) VALUES (?,?,?,?,?,?)",
         (data.get("title", "Sin titulo"), data.get("description"),
-         data.get("priority", "media"), data.get("category", "general"), data.get("due_date"))
+         data.get("priority", "media"), data.get("category", "general"),
+         data.get("due_date"), data.get("source_event_id"))
     )
     conn.commit()
     row = conn.execute("SELECT last_insert_rowid()").fetchone()
@@ -360,24 +470,26 @@ def complete_task(search_term):
 
 def get_pending_tasks(category=None):
     conn = get_db()
+    cols = ("id,title,description,priority,category,due_date,status,created_at,completed_at,"
+            "nudge_count,last_nudged_at,postpone_count")
     if category and category != "null":
         rows = conn.execute(
-            "SELECT id,title,description,priority,category,due_date,status,created_at,completed_at "
-            "FROM tasks WHERE status='pendiente' AND category=? "
+            "SELECT " + cols + " FROM tasks WHERE status='pendiente' AND category=? "
             "ORDER BY CASE priority WHEN 'alta' THEN 1 WHEN 'media' THEN 2 ELSE 3 END, due_date",
             (category,)
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT id,title,description,priority,category,due_date,status,created_at,completed_at "
-            "FROM tasks WHERE status='pendiente' "
+            "SELECT " + cols + " FROM tasks WHERE status='pendiente' "
             "ORDER BY CASE priority WHEN 'alta' THEN 1 WHEN 'media' THEN 2 ELSE 3 END, due_date"
         ).fetchall()
     result = []
     for r in rows:
         result.append({"id": r[0], "title": r[1], "description": r[2], "priority": r[3],
                         "category": r[4], "due_date": r[5], "status": r[6],
-                        "created_at": r[7], "completed_at": r[8]})
+                        "created_at": r[7], "completed_at": r[8],
+                        "nudge_count": r[9] or 0, "last_nudged_at": r[10],
+                        "postpone_count": r[11] or 0})
     return result
 
 
@@ -385,7 +497,8 @@ def get_overdue_tasks():
     today = datetime.now(tz).strftime("%Y-%m-%d")
     conn = get_db()
     rows = conn.execute(
-        "SELECT id,title,description,priority,category,due_date,status,created_at,completed_at "
+        "SELECT id,title,description,priority,category,due_date,status,created_at,completed_at,"
+        "nudge_count,last_nudged_at,postpone_count "
         "FROM tasks WHERE status='pendiente' AND due_date<? AND due_date IS NOT NULL",
         (today,)
     ).fetchall()
@@ -393,8 +506,79 @@ def get_overdue_tasks():
     for r in rows:
         result.append({"id": r[0], "title": r[1], "description": r[2], "priority": r[3],
                         "category": r[4], "due_date": r[5], "status": r[6],
-                        "created_at": r[7], "completed_at": r[8]})
+                        "created_at": r[7], "completed_at": r[8],
+                        "nudge_count": r[9] or 0, "last_nudged_at": r[10],
+                        "postpone_count": r[11] or 0})
     return result
+
+
+def get_tasks_to_nudge(cap):
+    today_start = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    today_str = datetime.now(tz).strftime("%Y-%m-%d")
+    now_iso = datetime.now(tz).isoformat()
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id,title,description,priority,category,due_date,created_at,"
+        "nudge_count,last_nudged_at,postpone_count "
+        "FROM tasks WHERE status='pendiente' "
+        "AND due_date IS NOT NULL AND due_date < ? "
+        "AND (last_nudged_at IS NULL OR last_nudged_at < ?) "
+        "AND COALESCE(nudge_count, 0) < ? "
+        "AND (snoozed_until IS NULL OR snoozed_until < ?) "
+        "ORDER BY CASE priority WHEN 'alta' THEN 1 WHEN 'media' THEN 2 ELSE 3 END, due_date "
+        "LIMIT 10",
+        (today_str, today_start, cap, now_iso)
+    ).fetchall()
+    result = []
+    for r in rows:
+        result.append({"id": r[0], "title": r[1], "description": r[2], "priority": r[3],
+                       "category": r[4], "due_date": r[5], "created_at": r[6],
+                       "nudge_count": r[7] or 0, "last_nudged_at": r[8],
+                       "postpone_count": r[9] or 0})
+    return result
+
+
+def increment_nudge_count(task_id):
+    conn = get_db()
+    now_iso = datetime.now(tz).isoformat()
+    conn.execute(
+        "UPDATE tasks SET nudge_count = COALESCE(nudge_count, 0) + 1, last_nudged_at=? WHERE id=?",
+        (now_iso, task_id)
+    )
+    conn.commit()
+
+
+def kill_task(search_term):
+    conn = get_db()
+    tasks = conn.execute(
+        "SELECT id,title FROM tasks WHERE status='pendiente' AND LOWER(title) LIKE ?",
+        ("%" + search_term.lower() + "%",)
+    ).fetchall()
+    if len(tasks) == 1:
+        conn.execute("UPDATE tasks SET status='killed' WHERE id=?", (tasks[0][0],))
+        conn.commit()
+        return tasks[0][1]
+    elif len(tasks) > 1:
+        return "MULTIPLE:" + ", ".join(t[1] for t in tasks)
+    return None
+
+
+def postpone_task(search_term, new_due_date):
+    conn = get_db()
+    tasks = conn.execute(
+        "SELECT id,title FROM tasks WHERE status='pendiente' AND LOWER(title) LIKE ?",
+        ("%" + search_term.lower() + "%",)
+    ).fetchall()
+    if len(tasks) == 1:
+        conn.execute(
+            "UPDATE tasks SET due_date=?, postpone_count = COALESCE(postpone_count, 0) + 1 WHERE id=?",
+            (new_due_date, tasks[0][0])
+        )
+        conn.commit()
+        return tasks[0][1]
+    elif len(tasks) > 1:
+        return "MULTIPLE:" + ", ".join(t[1] for t in tasks)
+    return None
 
 
 def get_recent_ideas(limit=10):
@@ -471,6 +655,73 @@ def mark_calendar_notification_sent(event_id, notif_type):
     conn.execute(
         "INSERT OR IGNORE INTO calendar_notifications_sent (event_id, notification_type) VALUES (?, ?)",
         (event_id, notif_type)
+    )
+    conn.commit()
+
+
+def add_event_followup(event_id, event_title, event_end_at_iso, scheduled_at_iso):
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO event_followups (event_id, event_title, event_end_at, scheduled_at) "
+        "VALUES (?, ?, ?, ?)",
+        (event_id, event_title, event_end_at_iso, scheduled_at_iso)
+    )
+    conn.commit()
+
+
+def get_due_event_followups():
+    conn = get_db()
+    now_iso = datetime.now(tz).isoformat()
+    rows = conn.execute(
+        "SELECT id, event_id, event_title, event_end_at, scheduled_at "
+        "FROM event_followups WHERE status='pending' AND scheduled_at<=?",
+        (now_iso,)
+    ).fetchall()
+    return [
+        {"id": r[0], "event_id": r[1], "event_title": r[2], "event_end_at": r[3], "scheduled_at": r[4]}
+        for r in rows
+    ]
+
+
+def mark_event_followup_sent(followup_id):
+    conn = get_db()
+    now_iso = datetime.now(tz).isoformat()
+    conn.execute(
+        "UPDATE event_followups SET status='sent', sent_at=? WHERE id=?",
+        (now_iso, followup_id)
+    )
+    conn.commit()
+
+
+def get_active_event_followup():
+    conn = get_db()
+    row = conn.execute(
+        "SELECT id, event_id, event_title FROM event_followups "
+        "WHERE status='sent' AND responded_at IS NULL "
+        "ORDER BY sent_at DESC LIMIT 1"
+    ).fetchone()
+    if not row:
+        return None
+    return {"id": row[0], "event_id": row[1], "event_title": row[2]}
+
+
+def mark_event_followup_responded(followup_id, outcome):
+    conn = get_db()
+    now_iso = datetime.now(tz).isoformat()
+    conn.execute(
+        "UPDATE event_followups SET status='responded', responded_at=?, outcome=? WHERE id=?",
+        (now_iso, outcome, followup_id)
+    )
+    conn.commit()
+
+
+def expire_stale_event_followups(hours=4):
+    conn = get_db()
+    cutoff_iso = (datetime.now(tz) - timedelta(hours=hours)).isoformat()
+    conn.execute(
+        "UPDATE event_followups SET status='no_response' "
+        "WHERE status='sent' AND responded_at IS NULL AND sent_at<?",
+        (cutoff_iso,)
     )
     conn.commit()
 
@@ -642,6 +893,36 @@ async def process_message(phone, text):
         else:
             await send_whatsapp(phone, "\U0001f50d No encontre esa tarea. Escribe *pendientes* para ver la lista.")
 
+    elif intent == "kill":
+        search = data.get("search_term", "")
+        found = kill_task(search)
+        if found and found.startswith("MULTIPLE:"):
+            await send_whatsapp(phone, "\U0001f914 Varias coinciden:\n" + found[9:] + "\n\nSe mas especifico.")
+        elif found:
+            msg = "\U0001f5d1 *Descartada:* " + found
+            if response_text:
+                msg = msg + "\n\n" + response_text
+            await send_whatsapp(phone, msg)
+        else:
+            await send_whatsapp(phone, "\U0001f50d No encontre esa tarea para descartar.")
+
+    elif intent == "postpone":
+        search = data.get("search_term", "")
+        new_date = data.get("new_due_date", "")
+        if not new_date:
+            await send_whatsapp(phone, "¿Para que fecha la posponemos? Dame el dia concreto.")
+        else:
+            found = postpone_task(search, new_date)
+            if found and found.startswith("MULTIPLE:"):
+                await send_whatsapp(phone, "\U0001f914 Varias coinciden:\n" + found[9:] + "\n\nSe mas especifico.")
+            elif found:
+                msg = "⏭ Pospuesta: *" + found + "* -> " + new_date
+                if response_text:
+                    msg = msg + "\n\n" + response_text
+                await send_whatsapp(phone, msg)
+            else:
+                await send_whatsapp(phone, "\U0001f50d No encontre esa tarea para posponer.")
+
     elif intent == "learn":
         key = data.get("key", "")
         value = data.get("value", "")
@@ -668,12 +949,45 @@ async def process_message(phone, text):
                     end_dt = start_dt + timedelta(minutes=int(duration_min))
                     event = gcal.create_event(title, start_dt.isoformat(), end_dt.isoformat(), description)
                     if event:
+                        evt_id = event.get("id", "")
+                        if evt_id:
+                            followup_at = end_dt + timedelta(minutes=get_timing("post_event_min"))
+                            add_event_followup(evt_id, title, end_dt.isoformat(), followup_at.isoformat())
                         await send_whatsapp(phone, gcal.format_event_for_creation(event))
                     else:
                         await send_whatsapp(phone, "Hubo un error creando el evento. Intenta de nuevo.")
                 except Exception as e:
                     logger.error("Error procesando agendar_evento: %s", e)
                     await send_whatsapp(phone, "Hubo un error con la fecha/hora. Intenta de nuevo.")
+
+    elif intent == "event_followup_response":
+        active = get_active_event_followup()
+        if not active:
+            await send_whatsapp(phone, response_text or "Anotado.")
+        else:
+            outcome = data.get("outcome", "unknown")
+            mark_event_followup_responded(active["id"], outcome)
+            pending = data.get("pending_tasks") or []
+            created_ids = []
+            for title in pending:
+                if not title or not str(title).strip():
+                    continue
+                tid = add_task({
+                    "title": str(title).strip(),
+                    "priority": "media",
+                    "category": "general",
+                    "source_event_id": active["event_id"],
+                })
+                created_ids.append(tid)
+            if created_ids:
+                msg = "✅ Anotado. " + str(len(created_ids)) + " pendiente(s) guardado(s) de *" + (active.get("event_title") or "la reunion") + "*."
+            elif outcome == "didnt_happen":
+                msg = "\U0001f44c Marcada como no realizada."
+            else:
+                msg = "\U0001f44d Anotado."
+            if response_text and response_text not in msg:
+                msg = msg + "\n\n" + response_text
+            await send_whatsapp(phone, msg)
 
     else:
         await send_whatsapp(phone, response_text)
@@ -727,7 +1041,14 @@ async def evening_review():
 async def check_calendar_events():
     if not gcal.is_configured() or not MY_PHONE_NUMBER:
         return
-    events = gcal.list_upcoming_events(minutes_ahead=35)
+    targets = [
+        get_timing("pre_event_min_1"),
+        get_timing("pre_event_min_2"),
+        get_timing("pre_event_min_3"),
+        get_timing("pre_event_min_4"),
+    ]
+    max_target = max(targets) if targets else 30
+    events = gcal.list_upcoming_events(minutes_ahead=max_target + 5)
     now = datetime.now(tz)
     for event in events:
         event_id = event.get("id", "")
@@ -739,16 +1060,103 @@ async def check_calendar_events():
         except Exception:
             continue
         delta_min = (start_dt - now).total_seconds() / 60
+        for target in targets:
+            notif_type = "T-" + str(target)
+            if abs(delta_min - target) <= 1.5 and not is_calendar_notification_sent(event_id, notif_type):
+                await send_whatsapp(MY_PHONE_NUMBER, gcal.format_event_for_reminder(event, notif_type))
+                mark_calendar_notification_sent(event_id, notif_type)
 
-        if 25 <= delta_min <= 30 and not is_calendar_notification_sent(event_id, "T-30"):
-            await send_whatsapp(MY_PHONE_NUMBER, gcal.format_event_for_reminder(event, "T-30"))
-            mark_calendar_notification_sent(event_id, "T-30")
-        if 10 <= delta_min <= 15 and not is_calendar_notification_sent(event_id, "T-15"):
-            await send_whatsapp(MY_PHONE_NUMBER, gcal.format_event_for_reminder(event, "T-15"))
-            mark_calendar_notification_sent(event_id, "T-15")
-        if -5 <= delta_min <= 1 and not is_calendar_notification_sent(event_id, "T-0"):
-            await send_whatsapp(MY_PHONE_NUMBER, gcal.format_event_for_reminder(event, "T-0"))
-            mark_calendar_notification_sent(event_id, "T-0")
+
+async def check_pending_followups():
+    if not MY_PHONE_NUMBER:
+        return
+    expire_stale_event_followups(hours=get_timing("followup_no_response_hours"))
+    due = get_due_event_followups()
+    for f in due:
+        title = f.get("event_title") or "(sin titulo)"
+        post_min = get_timing("post_event_min")
+        msg = (
+            "\U0001f50d Tu reunion *" + title + "* termino hace ~" + str(post_min) + " min.\n"
+            "¿Se dio? ¿Que quedo pendiente?"
+        )
+        await send_whatsapp(MY_PHONE_NUMBER, msg)
+        save_conversation("assistant", msg)
+        mark_event_followup_sent(f["id"])
+
+
+def generate_nudge_message(task, cap):
+    today = datetime.now(tz).date()
+    days_overdue = 0
+    if task.get("due_date"):
+        try:
+            d = datetime.strptime(task["due_date"], "%Y-%m-%d").date()
+            days_overdue = max(0, (today - d).days)
+        except Exception:
+            pass
+    nudge_count = task.get("nudge_count", 0)
+    postpone_count = task.get("postpone_count", 0)
+    is_final = nudge_count + 1 >= cap
+
+    sys = (
+        "Eres el asistente personal de Christian. Vas a generar UN mensaje proactivo "
+        "para recordarle UNA tarea pendiente. Una sola linea, dos como mucho. "
+        "Espanol colombiano informal. Sin saludos. Sin emojis salvo si suma. "
+        "Tono basado en datos:\n"
+        "- Si nudges previos == 0 y postergaciones == 0: recordatorio amable.\n"
+        "- Si nudges previos >= 2 o postergaciones >= 1: confronta con los datos. Mencionalos.\n"
+        "- Si es el ULTIMO recordatorio (cap alcanzado): forzar decision. Pide explicito: "
+        "hacerla ahora con un primer paso de 5 min, replantear con fecha y hora concretas, o "
+        "matarla. 'Mañana' NO es respuesta valida.\n"
+        "Responde SOLO JSON valido sin markdown: {\"message\":\"...\"}"
+    )
+    user = (
+        "Tarea: " + task.get("title", "") + "\n"
+        "Prioridad: " + task.get("priority", "media") + "\n"
+        "Categoria: " + task.get("category", "general") + "\n"
+        "Dias vencida: " + str(days_overdue) + "\n"
+        "Nudges previos: " + str(nudge_count) + "\n"
+        "Postergaciones previas: " + str(postpone_count) + "\n"
+        "Es ultimo recordatorio (forzar decision): " + ("si" if is_final else "no")
+    )
+    try:
+        resp = openai_client.chat.completions.create(
+            model="gpt-5.4-mini",
+            max_completion_tokens=200,
+            temperature=0.7,
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+        )
+        raw = resp.choices[0].message.content.strip().replace("```json", "").replace("```", "").strip()
+        parsed = json.loads(raw)
+        msg = parsed.get("message", "").strip()
+        if msg:
+            return msg
+    except Exception as e:
+        logger.error("generate_nudge_message error: %s", e)
+    if is_final:
+        return ("Sigue pendiente: *" + task.get("title", "") + "*. Ya van " + str(nudge_count) +
+                " recordatorios. Decision: la haces ahora con un primer paso de 5 min, "
+                "le pones fecha real, o la matas. 'Mañana' no vale otra vez.")
+    return ("Recordatorio: *" + task.get("title", "") + "*" +
+            (" - vencida " + str(days_overdue) + " d" if days_overdue > 0 else ""))
+
+
+async def check_overdue_nudges():
+    if not MY_PHONE_NUMBER:
+        return
+    now = datetime.now(tz)
+    start_h = get_timing("nudge_window_start_hour")
+    end_h = get_timing("nudge_window_end_hour")
+    if not (start_h <= now.hour < end_h):
+        return
+    if gcal.is_configured() and gcal.is_event_active_now():
+        return
+    cap = get_timing("nudge_cap_per_task")
+    tasks = get_tasks_to_nudge(cap)
+    for t in tasks:
+        msg = generate_nudge_message(t, cap)
+        await send_whatsapp(MY_PHONE_NUMBER, msg)
+        save_conversation("assistant", msg)
+        increment_nudge_count(t["id"])
 
 
 app = FastAPI(title="Asistente Personal WhatsApp v3")
@@ -757,11 +1165,14 @@ app = FastAPI(title="Asistente Personal WhatsApp v3")
 @app.on_event("startup")
 async def startup():
     init_db()
+    migrate_schema()
     scheduler.add_job(check_reminders, IntervalTrigger(minutes=1), id="reminders")
     scheduler.add_job(morning_summary, CronTrigger(hour=7, minute=0), id="morning")
     scheduler.add_job(evening_review, CronTrigger(hour=21, minute=0), id="evening")
+    scheduler.add_job(check_overdue_nudges, IntervalTrigger(hours=1), id="nudges")
     if gcal.is_configured():
-        scheduler.add_job(check_calendar_events, IntervalTrigger(minutes=5), id="gcal")
+        scheduler.add_job(check_calendar_events, IntervalTrigger(minutes=1), id="gcal")
+        scheduler.add_job(check_pending_followups, IntervalTrigger(minutes=5), id="followups")
         logger.info("Google Calendar: configurado")
     else:
         logger.warning("Google Calendar: NO configurado (faltan env vars GOOGLE_*)")
@@ -879,6 +1290,12 @@ ADMIN_HTML_TEMPLATE = """<!DOCTYPE html>
         .status-err { background: #f8d7da; color: #721c24; }
         .status-loading { background: #fff3cd; color: #856404; }
         code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; font-family: "Menlo", monospace; font-size: 12px; }
+        h2 { font-size: 22px; margin-bottom: 4px; }
+        .timings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; background: white; border: 1px solid #d2d2d7; padding: 18px; border-radius: 8px; }
+        .timing-field { display: flex; flex-direction: column; gap: 4px; }
+        .timing-field label { font-size: 13px; font-weight: 500; }
+        .timing-field .desc { color: #6e6e73; font-size: 12px; }
+        .timing-field input { padding: 8px 10px; font-size: 14px; border: 1px solid #d2d2d7; border-radius: 6px; font-family: "Menlo", monospace; }
     </style>
 </head>
 <body>
@@ -891,6 +1308,7 @@ ADMIN_HTML_TEMPLATE = """<!DOCTYPE html>
         <strong>Marcadores que el bot reemplaza solo:</strong><br>
         <code>{{CONTEXT_BLOCK}}</code> tu contexto guardado &nbsp;
         <code>{{TASKS_BLOCK}}</code> tus tareas pendientes &nbsp;
+        <code>{{EVENTS_BLOCK}}</code> eventos proximas 24h &nbsp;
         <code>{{IDEAS_BLOCK}}</code> tus ideas recientes<br>
         <code>{{CURRENT_DATE}}</code> &nbsp;
         <code>{{DAY_NAME}}</code> &nbsp;
@@ -906,6 +1324,18 @@ ADMIN_HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
 
     <div id="status"></div>
+
+    <h2 style="margin-top: 40px;">Variables de tiempos</h2>
+    <p class="sub">Cambios aplican en tiempo real. Sin redeploy.</p>
+
+    <div class="timings-grid" id="timings-grid">__TIMINGS_INPUTS__</div>
+
+    <div class="btn-row">
+        <button class="btn-save" onclick="saveTimings()">Guardar tiempos</button>
+        <button class="btn-reset" onclick="resetTimings()">Volver a defaults</button>
+    </div>
+
+    <div id="timings-status"></div>
 
     <script>
         function setStatus(text, kind) {
@@ -945,9 +1375,84 @@ ADMIN_HTML_TEMPLATE = """<!DOCTYPE html>
                 setStatus("Error de red: " + e.message, "err");
             }
         }
+        function setTimingsStatus(text, kind) {
+            const s = document.getElementById("timings-status");
+            s.textContent = text;
+            s.className = "status-" + kind;
+        }
+        async function saveTimings() {
+            setTimingsStatus("Guardando...", "loading");
+            const inputs = document.querySelectorAll("#timings-grid input[data-key]");
+            const values = {};
+            for (const i of inputs) {
+                const v = i.value.trim();
+                if (v === "") continue;
+                if (!/^-?\d+$/.test(v)) {
+                    setTimingsStatus("Valor invalido en " + i.dataset.key + " (debe ser entero)", "err");
+                    return;
+                }
+                values[i.dataset.key] = parseInt(v, 10);
+            }
+            try {
+                const r = await fetch("/admin/timings", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({timings: values})
+                });
+                if (r.ok) {
+                    setTimingsStatus("Tiempos guardados. Aplican en tiempo real.", "ok");
+                } else {
+                    setTimingsStatus("Error " + r.status + ": " + await r.text(), "err");
+                }
+            } catch(e) {
+                setTimingsStatus("Error de red: " + e.message, "err");
+            }
+        }
+        async function resetTimings() {
+            if (!confirm("Volver todos los tiempos a sus defaults?")) return;
+            setTimingsStatus("Reseteando...", "loading");
+            try {
+                const r = await fetch("/admin/timings/reset", {method: "POST"});
+                if (r.ok) {
+                    setTimingsStatus("Reseteado. Recarga la pagina para ver los defaults.", "ok");
+                } else {
+                    setTimingsStatus("Error " + r.status, "err");
+                }
+            } catch(e) {
+                setTimingsStatus("Error de red: " + e.message, "err");
+            }
+        }
     </script>
 </body>
 </html>"""
+
+
+TIMING_LABELS = [
+    ("pre_event_min_1", "Pre-evento aviso 1 (min antes)", "El primero, el mas temprano"),
+    ("pre_event_min_2", "Pre-evento aviso 2 (min antes)", ""),
+    ("pre_event_min_3", "Pre-evento aviso 3 (min antes)", ""),
+    ("pre_event_min_4", "Pre-evento aviso 4 (min antes)", "0 = al momento de empezar"),
+    ("post_event_min", "Post-evento follow-up (min despues)", "Cuando preguntar ¿se dio?"),
+    ("nudge_window_start_hour", "Ventana nudges - hora inicio", "0-23, hora local"),
+    ("nudge_window_end_hour", "Ventana nudges - hora fin", "0-23, hora local"),
+    ("nudge_cap_per_task", "Max nudges por tarea", "Despues de N, forzar decision"),
+    ("followup_no_response_hours", "Followup sin respuesta (horas)", "Si no contestas, marca no_response"),
+]
+
+
+def _render_timings_inputs():
+    parts = []
+    for key, label, desc in TIMING_LABELS:
+        val = get_timing(key)
+        desc_html = ('<span class="desc">' + html_lib.escape(desc) + '</span>') if desc else ""
+        parts.append(
+            '<div class="timing-field">'
+            '<label for="t-' + key + '">' + html_lib.escape(label) + '</label>'
+            + desc_html +
+            '<input id="t-' + key + '" data-key="' + key + '" type="number" value="' + str(val) + '">'
+            '</div>'
+        )
+    return "\n".join(parts)
 
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -963,6 +1468,7 @@ async def admin_page(_: bool = Depends(admin_auth)):
     html = (ADMIN_HTML_TEMPLATE
         .replace("__BANNER__", banner)
         .replace("__PROMPT__", html_lib.escape(current))
+        .replace("__TIMINGS_INPUTS__", _render_timings_inputs())
     )
     return HTMLResponse(html)
 
@@ -989,4 +1495,44 @@ async def admin_save_prompt(request: Request, _: bool = Depends(admin_auth)):
 @app.post("/admin/prompt/reset")
 async def admin_reset_prompt(_: bool = Depends(admin_auth)):
     delete_config("system_prompt")
+    return {"status": "ok"}
+
+
+@app.get("/admin/timings")
+async def admin_get_timings(_: bool = Depends(admin_auth)):
+    return {
+        "timings": {key: get_timing(key) for key, _label, _desc in TIMING_LABELS},
+        "defaults": {key: TIMING_DEFAULTS[key] for key, _label, _desc in TIMING_LABELS},
+    }
+
+
+@app.post("/admin/timings")
+async def admin_save_timings(request: Request, _: bool = Depends(admin_auth)):
+    body = await request.json()
+    incoming = body.get("timings", {})
+    if not isinstance(incoming, dict):
+        raise HTTPException(400, "Formato invalido")
+    allowed = {key for key, _label, _desc in TIMING_LABELS}
+    saved = {}
+    for key, raw_val in incoming.items():
+        if key not in allowed:
+            continue
+        try:
+            int_val = int(raw_val)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Valor no entero para " + key)
+        if key in ("nudge_window_start_hour", "nudge_window_end_hour"):
+            if not (0 <= int_val <= 23):
+                raise HTTPException(400, "Hora fuera de rango (0-23) en " + key)
+        elif int_val < 0:
+            raise HTTPException(400, "Valor negativo no permitido en " + key)
+        set_config(key, str(int_val))
+        saved[key] = int_val
+    return {"status": "ok", "saved": saved}
+
+
+@app.post("/admin/timings/reset")
+async def admin_reset_timings(_: bool = Depends(admin_auth)):
+    for key, _label, _desc in TIMING_LABELS:
+        delete_config(key)
     return {"status": "ok"}
