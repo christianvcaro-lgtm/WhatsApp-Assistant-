@@ -279,7 +279,7 @@ complete: {"search_term":"texto para buscar la tarea"}
 kill: {"search_term":"texto para buscar la tarea"}
 postpone: {"search_term":"texto para buscar la tarea","new_due_date":"YYYY-MM-DD"}
 learn: {"key":"tema corto","value":"lo que debe recordar"}
-agendar_evento: {"title":"corto","start_date":"YYYY-MM-DD","start_time":"HH:MM","duration_minutes":60,"description":"opcional o null"}
+agendar_evento: {"title":"corto","start_date":"YYYY-MM-DD","start_time":"HH:MM","duration_minutes":60,"description":"opcional o null","attendees":["email1@x.com","email2@y.com"] o []}
 event_followup_response: {"outcome":"happened|didnt_happen|unknown","pending_tasks":["titulo corto 1","titulo corto 2"]}
 chat: {}
 
@@ -311,6 +311,12 @@ TONO ADAPTATIVO SEGUN HISTORIAL DE LA TAREA:
 CONCIENCIA DE CALENDARIO:
 - Si en EVENTOS PROXIMAS 24H hay un evento empezando en menos de 15 min, considera mencionarlo en tu respuesta o moderar la conversacion ("oye, tienes X en 10 min, esto lo vemos despues?").
 - No agendes tareas o reminders que pisen un evento existente sin avisar.
+
+INVITADOS EN agendar_evento (campo attendees):
+- Si Christian incluye emails en el mensaje ("agenda reunion con juan@x.com y maria@y.com"), ponlos todos en attendees. Google les manda invitacion automatica.
+- Si menciona personas por nombre sin email ("agenda reunion con Juan"), busca el email en CONOCIMIENTO PERSONAL DE CHRISTIAN (claves como "email_juan", "correo_juan", etc.). Si lo encuentras, ponlo en attendees. Si NO lo encuentras, igual crea el evento con attendees=[] y en response_text pide el email faltante ("agendado, pero no tengo el email de Juan - pasamelo y lo agrego / la proxima me lo aprendo con 'recuerda que email_juan es ...'").
+- Si no menciona a nadie mas, attendees=[].
+- Nunca inventes emails.
 {{TASKS_BLOCK}}{{EVENTS_BLOCK}}{{IDEAS_BLOCK}}
 
 FECHA: {{CURRENT_DATE}} ({{DAY_NAME}}) | HORA: {{CURRENT_TIME}}
@@ -951,19 +957,30 @@ async def process_message(phone, text):
             start_time = data.get("start_time", "")
             duration_min = data.get("duration_minutes") or 60
             description = data.get("description")
+            attendees_raw = data.get("attendees") or []
+            attendees = [str(a).strip() for a in attendees_raw if str(a or "").strip() and "@" in str(a)]
             if not title or not start_date or not start_time:
                 await send_whatsapp(phone, "No entendi bien la fecha/hora del evento. Reformulalo?")
             else:
                 try:
                     start_dt = datetime.strptime(start_date + " " + start_time, "%Y-%m-%d %H:%M").replace(tzinfo=tz)
                     end_dt = start_dt + timedelta(minutes=int(duration_min))
-                    event = gcal.create_event(title, start_dt.isoformat(), end_dt.isoformat(), description)
+                    event = gcal.create_event(
+                        title,
+                        start_dt.isoformat(),
+                        end_dt.isoformat(),
+                        description,
+                        attendees=attendees,
+                    )
                     if event:
                         evt_id = event.get("id", "")
                         if evt_id:
                             followup_at = end_dt + timedelta(minutes=get_timing("post_event_min"))
                             add_event_followup(evt_id, title, end_dt.isoformat(), followup_at.isoformat())
-                        await send_whatsapp(phone, gcal.format_event_for_creation(event))
+                        msg = gcal.format_event_for_creation(event)
+                        if response_text:
+                            msg = msg + "\n\n" + response_text
+                        await send_whatsapp(phone, msg)
                     else:
                         await send_whatsapp(phone, "Hubo un error creando el evento. Intenta de nuevo.")
                 except Exception as e:

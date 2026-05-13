@@ -145,6 +145,7 @@ def create_event(
     start_iso: str,
     end_iso: Optional[str] = None,
     description: Optional[str] = None,
+    attendees: Optional[list] = None,
 ) -> Optional[dict]:
     service = get_calendar_service()
     if not service:
@@ -173,11 +174,22 @@ def create_event(
     }
     if description:
         body["description"] = description
+
+    clean_attendees = []
+    for a in (attendees or []):
+        email = (a or "").strip()
+        if email and "@" in email:
+            clean_attendees.append({"email": email})
+    if clean_attendees:
+        body["attendees"] = clean_attendees
+
     try:
-        return service.events().insert(
+        request = service.events().insert(
             calendarId=GOOGLE_CALENDAR_ID,
             body=body,
-        ).execute()
+            sendUpdates="all" if clean_attendees else "none",
+        )
+        return request.execute()
     except HttpError as e:
         logger.error("gcal create error: %s", e)
         return None
@@ -223,6 +235,7 @@ def format_event_for_creation(event: dict) -> str:
     start = event.get("start", {}).get("dateTime", "")
     end = event.get("end", {}).get("dateTime", "")
     link = event.get("htmlLink", "")
+    attendees = event.get("attendees", []) or []
 
     date_str = ""
     start_time = ""
@@ -244,6 +257,11 @@ def format_event_for_creation(event: dict) -> str:
         msg = msg + "\n\U0001f4c6 " + date_str
     if start_time and end_time:
         msg = msg + " ⏰ " + start_time + " - " + end_time
+
+    guest_emails = [a.get("email", "") for a in attendees if a.get("email")]
+    if guest_emails:
+        msg = msg + "\n\U0001f465 Invitados: " + ", ".join(guest_emails)
+
     if link:
         msg = msg + "\n\U0001f517 " + link
     return msg
