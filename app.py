@@ -2,6 +2,7 @@ import os
 import json
 import html as html_lib
 import secrets
+import asyncio
 import httpx
 import logging
 from datetime import datetime, timedelta
@@ -205,6 +206,7 @@ TIMING_DEFAULTS = {
     "nudge_window_end_hour": 21,
     "nudge_cap_per_task": 5,
     "followup_no_response_hours": 4,
+    "message_buffer_seconds": 5,
 }
 
 
@@ -1193,6 +1195,60 @@ async def shutdown():
     scheduler.shutdown()
 
 
+QUICK_COMMANDS = {
+    "resumen", "como voy", "status",
+    "pendientes", "tareas", "mis tareas",
+    "ideas", "mis ideas",
+    "ayuda",
+}
+
+_message_buffers: dict[str, list[str]] = {}
+_buffer_tasks: dict[str, asyncio.Task] = {}
+_buffer_lock = asyncio.Lock()
+
+
+async def _flush_buffer(phone: str, wait_seconds: int):
+    try:
+        await asyncio.sleep(max(1, wait_seconds))
+    except asyncio.CancelledError:
+        return
+    async with _buffer_lock:
+        messages = _message_buffers.pop(phone, [])
+        _buffer_tasks.pop(phone, None)
+    if not messages:
+        return
+    combined = "\n".join(messages)
+    try:
+        await process_message(phone, combined)
+    except Exception as e:
+        logger.error("Error procesando buffer: %s", e)
+
+
+async def buffer_and_process(phone: str, text: str):
+    # Comandos rápidos: drenar cualquier buffer pendiente y procesar de inmediato.
+    if text.strip().lower() in QUICK_COMMANDS:
+        async with _buffer_lock:
+            existing = _buffer_tasks.pop(phone, None)
+            buffered = _message_buffers.pop(phone, [])
+        if existing and not existing.done():
+            existing.cancel()
+        if buffered:
+            try:
+                await process_message(phone, "\n".join(buffered))
+            except Exception as e:
+                logger.error("Error drenando buffer antes de quick command: %s", e)
+        await process_message(phone, text)
+        return
+
+    wait_seconds = get_timing("message_buffer_seconds")
+    async with _buffer_lock:
+        _message_buffers.setdefault(phone, []).append(text)
+        existing = _buffer_tasks.get(phone)
+        if existing and not existing.done():
+            existing.cancel()
+        _buffer_tasks[phone] = asyncio.create_task(_flush_buffer(phone, wait_seconds))
+
+
 @app.get("/webhook")
 async def verify_webhook(
     hub_mode: str = Query(None, alias="hub.mode"),
@@ -1220,14 +1276,14 @@ async def receive_webhook(request: Request):
                     if msg.get("type") == "text":
                         text = msg["text"]["body"]
                         logger.info("Mensaje de %s: %s", phone, text)
-                        await process_message(phone, text)
+                        await buffer_and_process(phone, text)
                     elif msg.get("type") == "audio":
                         logger.info("Audio de %s", phone)
                         try:
                             media_id = msg["audio"]["id"]
                             text = await transcribe_audio(media_id)
                             logger.info("Transcripcion: %s", text)
-                            await process_message(phone, text)
+                            await buffer_and_process(phone, text)
                         except Exception as e:
                             logger.error("Error transcribiendo audio: %s", e)
                             await send_whatsapp(phone, "No pude entender el audio. Intenta de nuevo o escribeme.")
@@ -1445,6 +1501,7 @@ TIMING_LABELS = [
     ("nudge_window_end_hour", "Ventana nudges - hora fin", "0-23, hora local"),
     ("nudge_cap_per_task", "Max nudges por tarea", "Despues de N, forzar decision"),
     ("followup_no_response_hours", "Followup sin respuesta (horas)", "Si no contestas, marca no_response"),
+    ("message_buffer_seconds", "Buffer de mensajes (segundos)", "Espera N seg antes de procesar; si llegan mas mensajes, los junta"),
 ]
 
 
