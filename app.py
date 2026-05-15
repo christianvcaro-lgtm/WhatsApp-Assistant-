@@ -528,6 +528,18 @@ def get_overdue_tasks():
     return result
 
 
+def get_tasks_due_on(date_str):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id,title,description,priority,category,due_date "
+        "FROM tasks WHERE status='pendiente' AND due_date=? "
+        "ORDER BY CASE priority WHEN 'alta' THEN 1 WHEN 'media' THEN 2 ELSE 3 END",
+        (date_str,)
+    ).fetchall()
+    return [{"id": r[0], "title": r[1], "description": r[2], "priority": r[3],
+             "category": r[4], "due_date": r[5]} for r in rows]
+
+
 def get_tasks_to_nudge(cap):
     today_start = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     today_str = datetime.now(tz).strftime("%Y-%m-%d")
@@ -1065,6 +1077,66 @@ async def evening_review():
     await send_whatsapp(MY_PHONE_NUMBER, msg)
 
 
+_DIAS_ES = ["lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo"]
+
+_PRIO_EMOJI = {"alta": "\U0001f534", "media": "\U0001f7e1", "baja": "⚪"}
+
+
+def _format_task_line(t):
+    prio = _PRIO_EMOJI.get(t.get("priority", "media"), "⚪")
+    cat = C_EMOJI.get(t.get("category", "general"), "\U0001f4cc")
+    return "• " + prio + " " + cat + " " + t.get("title", "")
+
+
+async def tomorrow_preview():
+    if not MY_PHONE_NUMBER:
+        return
+    t = datetime.now(tz) + timedelta(days=1)
+    tomorrow_label = _DIAS_ES[t.weekday()] + " " + t.strftime("%d/%m")
+    tomorrow_iso = t.strftime("%Y-%m-%d")
+
+    events = gcal.list_events_tomorrow() if gcal.is_configured() else []
+    tasks_tomorrow = get_tasks_due_on(tomorrow_iso)
+    overdue = get_overdue_tasks()
+
+    if not events and not tasks_tomorrow and not overdue:
+        msg = (
+            "\U0001f306 *Preview mañana* (" + tomorrow_label + ")\n\n"
+            "Sin reuniones ni tareas. Dia libre para enfocarte."
+        )
+        await send_whatsapp(MY_PHONE_NUMBER, msg)
+        return
+
+    sections = ["\U0001f306 *Preview mañana* (" + tomorrow_label + ")"]
+
+    sections.append("")
+    if events:
+        sections.append("\U0001f4c5 *Reuniones* (" + str(len(events)) + ")")
+        for e in events:
+            sections.append(gcal.format_event_for_daily_preview(e))
+    elif gcal.is_configured():
+        sections.append("\U0001f4c5 *Reuniones:* ninguna agendada")
+
+    if tasks_tomorrow:
+        sections.append("")
+        sections.append("\U0001f4cb *Tareas para mañana* (" + str(len(tasks_tomorrow)) + ")")
+        for tk in tasks_tomorrow:
+            sections.append(_format_task_line(tk))
+
+    if overdue:
+        sections.append("")
+        sections.append("⚠️ *Vencidas arrastradas* (" + str(len(overdue)) + ")")
+        for tk in overdue[:8]:
+            line = _format_task_line(tk)
+            if tk.get("due_date"):
+                line = line + " _(" + tk["due_date"] + ")_"
+            sections.append(line)
+        if len(overdue) > 8:
+            sections.append("…y " + str(len(overdue) - 8) + " mas")
+
+    await send_whatsapp(MY_PHONE_NUMBER, "\n".join(sections))
+
+
 async def check_calendar_events():
     if not gcal.is_configured() or not MY_PHONE_NUMBER:
         return
@@ -1195,6 +1267,7 @@ async def startup():
     migrate_schema()
     scheduler.add_job(check_reminders, IntervalTrigger(minutes=1), id="reminders")
     scheduler.add_job(morning_summary, CronTrigger(hour=7, minute=0), id="morning")
+    scheduler.add_job(tomorrow_preview, CronTrigger(hour=19, minute=0), id="tomorrow_preview")
     scheduler.add_job(evening_review, CronTrigger(hour=21, minute=0), id="evening")
     scheduler.add_job(check_overdue_nudges, IntervalTrigger(hours=1), id="nudges")
     if gcal.is_configured():

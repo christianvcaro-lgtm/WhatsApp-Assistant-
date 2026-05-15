@@ -104,6 +104,35 @@ def list_events_next_hours(hours_ahead: int = 24) -> list:
         return []
 
 
+def list_events_tomorrow() -> list:
+    service = get_calendar_service()
+    if not service:
+        return []
+    tz = ZoneInfo(GOOGLE_TIMEZONE)
+    now = datetime.now(tz)
+    tomorrow_start = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    day_after = tomorrow_start + timedelta(days=1)
+    time_min = tomorrow_start.isoformat()
+    time_max = day_after.isoformat()
+    try:
+        result = service.events().list(
+            calendarId=GOOGLE_CALENDAR_ID,
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=30,
+        ).execute()
+        events = result.get("items", [])
+        return [e for e in events if "dateTime" in e.get("start", {})]
+    except HttpError as e:
+        logger.error("gcal list_tomorrow error: %s", e)
+        return []
+    except Exception as e:
+        logger.error("gcal list_tomorrow unexpected error: %s", e)
+        return []
+
+
 def is_event_active_now() -> bool:
     service = get_calendar_service()
     if not service:
@@ -228,6 +257,41 @@ def format_event_for_reminder(event: dict, notification_type: str) -> str:
     if location:
         msg = msg + "\n\U0001f4cd " + location
     return msg
+
+
+def format_event_for_daily_preview(event: dict) -> str:
+    title = event.get("summary", "(sin titulo)")
+    location = event.get("location", "")
+    start_str = event.get("start", {}).get("dateTime", "")
+    end_str = event.get("end", {}).get("dateTime", "")
+    attendees = event.get("attendees", []) or []
+
+    time_str = ""
+    try:
+        start_dt = datetime.fromisoformat(start_str)
+        start_time = start_dt.strftime("%H:%M")
+        time_str = start_time
+        try:
+            end_dt = datetime.fromisoformat(end_str)
+            time_str = start_time + "-" + end_dt.strftime("%H:%M")
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    line = "• "
+    if time_str:
+        line = line + time_str + "  *" + title + "*"
+    else:
+        line = line + "*" + title + "*"
+
+    if location:
+        line = line + "\n   \U0001f4cd " + location
+
+    guest_count = len([a for a in attendees if a.get("email")])
+    if guest_count:
+        line = line + "\n   \U0001f465 " + str(guest_count) + " invitado" + ("s" if guest_count != 1 else "")
+    return line
 
 
 def format_event_for_creation(event: dict) -> str:

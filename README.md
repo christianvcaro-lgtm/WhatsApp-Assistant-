@@ -8,6 +8,7 @@ Bot de WhatsApp que captura tareas, ideas, te manda recordatorios y te da visibi
 - **Ideas**: Le dices “idea: hacer webinar de YAVE” → la guarda categorizada
 - **Recordatorios**: Le dices “recuérdame a las 3pm revisar métricas” → te avisa a esa hora
 - **Resumen matutino**: A las 7am te manda resumen del día con tareas urgentes
+- **Preview de mañana**: A las 7pm te lista las reuniones (si tienes Google Calendar conectado), las tareas que vencen al día siguiente y las vencidas que arrastras
 - **Cierre nocturno**: A las 9pm te dice qué completaste y qué queda pendiente
 - **Consultas**: “pendientes”, “ideas”, “resumen” → te muestra todo al instante
 
