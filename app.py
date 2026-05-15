@@ -86,6 +86,12 @@ def init_db():
         "key TEXT PRIMARY KEY,"
         "value TEXT NOT NULL,"
         "updated_at TEXT DEFAULT (datetime('now')));"
+        "CREATE TABLE IF NOT EXISTS memories ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "role TEXT NOT NULL,"
+        "content TEXT NOT NULL,"
+        "embedding TEXT NOT NULL,"
+        "created_at TEXT DEFAULT (datetime('now')));"
     )
     conn.commit()
 
@@ -162,6 +168,74 @@ def save_conversation(role, content):
         "(SELECT id FROM conversations ORDER BY id DESC LIMIT 50)"
     )
     conn.commit()
+    save_memory(role, content)
+
+
+def embed_text(text):
+    try:
+        resp = openai_client.embeddings.create(
+            input=text[:8000],
+            model="text-embedding-3-small"
+        )
+        return resp.data[0].embedding
+    except Exception as e:
+        logger.error("Embedding error: %s", e)
+        return None
+
+
+def save_memory(role, content):
+    if not content or not content.strip():
+        return
+    emb = embed_text(content)
+    if emb is None:
+        return
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO memories (role, content, embedding) VALUES (?, ?, ?)",
+        (role, content, json.dumps(emb))
+    )
+    conn.commit()
+
+
+def cosine_similarity(v1, v2):
+    dot = 0.0
+    n1 = 0.0
+    n2 = 0.0
+    for a, b in zip(v1, v2):
+        dot += a * b
+        n1 += a * a
+        n2 += b * b
+    if n1 == 0 or n2 == 0:
+        return 0
+    return dot / ((n1 ** 0.5) * (n2 ** 0.5))
+
+
+def search_memories(query_text, limit=5, exclude_recent=10, min_score=0.3):
+    if not query_text or not query_text.strip():
+        return []
+    query_emb = embed_text(query_text)
+    if query_emb is None:
+        return []
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, role, content, embedding, created_at FROM memories "
+        "ORDER BY id DESC LIMIT 2000"
+    ).fetchall()
+    if len(rows) <= exclude_recent:
+        return []
+    candidates = rows[exclude_recent:]
+    scored = []
+    for r in candidates:
+        try:
+            emb = json.loads(r[3])
+            score = cosine_similarity(query_emb, emb)
+            if score >= min_score:
+                scored.append((score, r[1], r[2], r[4]))
+        except Exception:
+            continue
+    scored.sort(reverse=True, key=lambda x: x[0])
+    return [{"role": s[1], "content": s[2], "created_at": s[3], "score": s[0]}
+            for s in scored[:limit]]
 
 
 def get_config(key, default=""):
@@ -268,6 +342,7 @@ INTENTS POSIBLES:
 - learn: cuando te ENSENA algo sobre el o sus proyectos (detecta: "recuerda que", "mi prioridad es", "ten en cuenta", "aprende que", "esto es importante")
 - agendar_evento: cuando quiere AGENDAR algo en su CALENDARIO de Google (detecta: "agendame", "agrega al calendario", "pon una reunion", "tengo una cita", "reserva X dia"). Distinto de reminder: agendar_evento crea evento en Google Calendar; reminder es solo un mensaje.
 - event_followup_response: SOLO cuando en la conversacion reciente TU (asistente) hiciste una pregunta del tipo "Tu reunion X termino hace ~30 min. ¿Se dio? ¿Que quedo pendiente?" y el usuario esta respondiendo a esa pregunta especifica. Detecta outcome (si la reunion ocurrio o no) y extrae los pendientes que menciona.
+- redactar: cuando quiere AYUDA PARA ESCRIBIR un mensaje a alguien (detecta: "ayudame a escribirle", "como le digo a", "que le respondo a", "redactame", "escribirle a", "mensaje para"). Genera 3 variaciones en SU voz (amigable colombiano informal, directo, calido, nunca corporativo).
 - chat: conversacion normal, consejo, ayuda para pensar
 
 DATA POR INTENT:
@@ -281,6 +356,7 @@ postpone: {"search_term":"texto para buscar la tarea","new_due_date":"YYYY-MM-DD
 learn: {"key":"tema corto","value":"lo que debe recordar"}
 agendar_evento: {"title":"corto","start_date":"YYYY-MM-DD","start_time":"HH:MM","duration_minutes":60,"description":"opcional o null","attendees":["email1@x.com","email2@y.com"] o []}
 event_followup_response: {"outcome":"happened|didnt_happen|unknown","pending_tasks":["titulo corto 1","titulo corto 2"]}
+redactar: {"destinatario":"para quien es el mensaje","contexto":"que quiere comunicar","variaciones":["v1 mas corta/directa","v2 mas calida","v3 alternativa"]}
 chat: {}
 
 REGLAS DE PRIORIDAD:
@@ -302,6 +378,7 @@ REGLAS DE INTELIGENCIA:
 - Si una idea se repite o contradice algo anterior, mencionalo.
 - En el chat, se genuinamente util. Ayuda a pensar, no solo a responder.
 - IMPORTANTE: en tu response, incluye la confirmacion de la accion Y cualquier comentario inteligente que tengas.
+- Si en MEMORIAS RELEVANTES ves algo conectado con lo que esta diciendo ahora (contradiccion, repeticion, contexto previo), mencionalo brevemente.
 
 TONO ADAPTATIVO SEGUN HISTORIAL DE LA TAREA:
 - Si una tarea tiene `nudges: N` con N >= 3, o `pospuesta N v` con N >= 2: NO la trates suave. Confronta con los datos ("ya te la recorde 3 veces", "ya la pospusiste 2 veces"). Pide decision concreta: hacerla ahora con un primer paso de 5 min, replantear con fecha y hora reales, o matarla (intent kill).
@@ -317,14 +394,14 @@ INVITADOS EN agendar_evento (campo attendees):
 - Si menciona personas por nombre sin email ("agenda reunion con Juan"), busca el email en CONOCIMIENTO PERSONAL DE CHRISTIAN (claves como "email_juan", "correo_juan", etc.). Si lo encuentras, ponlo en attendees. Si NO lo encuentras, igual crea el evento con attendees=[] y en response_text pide el email faltante ("agendado, pero no tengo el email de Juan - pasamelo y lo agrego / la proxima me lo aprendo con 'recuerda que email_juan es ...'").
 - Si no menciona a nadie mas, attendees=[].
 - Nunca inventes emails.
-{{TASKS_BLOCK}}{{EVENTS_BLOCK}}{{IDEAS_BLOCK}}
+{{TASKS_BLOCK}}{{EVENTS_BLOCK}}{{IDEAS_BLOCK}}{{MEMORIES_BLOCK}}
 
 FECHA: {{CURRENT_DATE}} ({{DAY_NAME}}) | HORA: {{CURRENT_TIME}}
 
 Para reminders: calcula fecha/hora real. 'manana a las 8' = fecha de manana 08:00. 'en 2 horas' = suma desde hora actual."""
 
 
-def build_system_prompt():
+def build_system_prompt(query_text=None):
     now = datetime.now(tz)
     current_date = now.strftime("%Y-%m-%d")
     current_time = now.strftime("%H:%M")
@@ -387,12 +464,24 @@ def build_system_prompt():
         except Exception as e:
             logger.error("events_block error: %s", e)
 
+    memories_block = ""
+    if query_text:
+        memories = search_memories(query_text, limit=5)
+        if memories:
+            memories_block = "\n\nMEMORIAS RELEVANTES (conversaciones pasadas relacionadas a lo que esta diciendo ahora):\n"
+            for m in memories:
+                role_label = "Christian" if m["role"] == "user" else "Yo"
+                date_label = m["created_at"][:10] if m["created_at"] else ""
+                content_short = m["content"][:200]
+                memories_block = memories_block + "- [" + date_label + "] " + role_label + ": " + content_short + "\n"
+
     body = get_config("system_prompt", DEFAULT_PROMPT_BODY)
     return (body
         .replace("{{CONTEXT_BLOCK}}", context_block)
         .replace("{{TASKS_BLOCK}}", tasks_block)
         .replace("{{IDEAS_BLOCK}}", ideas_block)
         .replace("{{EVENTS_BLOCK}}", events_block)
+        .replace("{{MEMORIES_BLOCK}}", memories_block)
         .replace("{{CURRENT_DATE}}", current_date)
         .replace("{{DAY_NAME}}", day_name)
         .replace("{{CURRENT_TIME}}", current_time)
@@ -400,7 +489,7 @@ def build_system_prompt():
 
 
 async def interpret_message(text):
-    prompt = build_system_prompt()
+    prompt = build_system_prompt(query_text=text)
     messages = [{"role": "system", "content": prompt}]
 
     history = get_recent_conversations(10)
@@ -960,6 +1049,23 @@ async def process_message(phone, text):
         else:
             await send_whatsapp(phone, response_text)
 
+    elif intent == "redactar":
+        variaciones = data.get("variaciones", [])
+        destinatario = data.get("destinatario", "")
+        if variaciones:
+            header = "✍️ *Opciones"
+            if destinatario:
+                header = header + " para " + destinatario
+            header = header + ":*"
+            msg = header
+            for i, v in enumerate(variaciones, 1):
+                msg = msg + "\n\n*" + str(i) + ".* " + v
+            if response_text and response_text not in variaciones:
+                msg = msg + "\n\n_" + response_text + "_"
+            await send_whatsapp(phone, msg)
+        else:
+            await send_whatsapp(phone, response_text or "No pude generar las variaciones, reformula?")
+
     elif intent == "agendar_evento":
         if not gcal.is_configured():
             await send_whatsapp(phone, "Google Calendar no esta configurado todavia.")
@@ -1137,6 +1243,103 @@ async def tomorrow_preview():
     await send_whatsapp(MY_PHONE_NUMBER, "\n".join(sections))
 
 
+def get_weekly_stats():
+    now = datetime.now(tz)
+    week_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+    today_str = now.strftime("%Y-%m-%d")
+    conn = get_db()
+    created = conn.execute(
+        "SELECT category, COUNT(*) FROM tasks WHERE created_at >= ? GROUP BY category",
+        (week_ago,)
+    ).fetchall()
+    completed = conn.execute(
+        "SELECT category, COUNT(*) FROM tasks WHERE completed_at >= ? GROUP BY category",
+        (week_ago,)
+    ).fetchall()
+    ideas_week = conn.execute(
+        "SELECT category, COUNT(*) FROM ideas WHERE created_at >= ? GROUP BY category",
+        (week_ago,)
+    ).fetchall()
+    pending = conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE status='pendiente'"
+    ).fetchone()[0]
+    pending_high = conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE status='pendiente' AND priority='alta'"
+    ).fetchone()[0]
+    overdue = conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE status='pendiente' AND due_date < ? AND due_date IS NOT NULL",
+        (today_str,)
+    ).fetchone()[0]
+    return {
+        "created_by_cat": {r[0]: r[1] for r in created},
+        "completed_by_cat": {r[0]: r[1] for r in completed},
+        "ideas_by_cat": {r[0]: r[1] for r in ideas_week},
+        "total_created": sum(r[1] for r in created),
+        "total_completed": sum(r[1] for r in completed),
+        "total_ideas": sum(r[1] for r in ideas_week),
+        "pending": pending,
+        "pending_high": pending_high,
+        "overdue": overdue,
+    }
+
+
+async def weekly_review():
+    if not MY_PHONE_NUMBER:
+        return
+    stats = get_weekly_stats()
+    ctx = get_all_context()
+    priority = ctx.get("prioridad_semana") or ctx.get("prioridad") or ""
+
+    def fmt_cat_dict(d):
+        if not d:
+            return "ninguna"
+        return ", ".join(k + ":" + str(v) for k, v in d.items())
+
+    stats_text = (
+        "Tareas creadas: " + str(stats["total_created"]) + " (" + fmt_cat_dict(stats["created_by_cat"]) + ")\n"
+        "Tareas completadas: " + str(stats["total_completed"]) + " (" + fmt_cat_dict(stats["completed_by_cat"]) + ")\n"
+        "Ideas guardadas: " + str(stats["total_ideas"]) + " (" + fmt_cat_dict(stats["ideas_by_cat"]) + ")\n"
+        "Pendientes totales: " + str(stats["pending"]) + " (" + str(stats["pending_high"]) + " alta prioridad)\n"
+        "Vencidas: " + str(stats["overdue"]) + "\n"
+    )
+    if priority:
+        stats_text = stats_text + "\nPrioridad declarada de Christian: " + priority
+
+    coach_prompt = (
+        "Eres el coach de Christian, no su asistente. Acabas de revisar su semana. "
+        "Estilo: directo, sin lambisconear, espanol colombiano informal. "
+        "Maximo 8 lineas en total. Nada de emojis (solo el del titulo que pone el sistema). "
+        "Si hay dispersion entre lo que declaro como prioridad y donde realmente puso energia, dilo claro. "
+        "Si la categoria con mas tareas creadas no coincide con la prioridad, mencionalo. "
+        "Si completo poco vs lo que creo, mencionalo (ratio creadas:completadas). "
+        "Si dejo cosas vencer, sin drama pero menciona. "
+        "Si lo hizo bien, reconoce sin exagerar - 1 linea. "
+        "Termina con UNA pregunta puntual o UNA sugerencia concreta para la proxima semana. "
+        "No repitas los numeros, ya los va a ver arriba. Habla del patron, no de la data.\n\n"
+        "Datos de la semana:\n" + stats_text
+    )
+
+    try:
+        resp = openai_client.chat.completions.create(
+            model="gpt-5.4-mini",
+            max_completion_tokens=500,
+            temperature=0.7,
+            messages=[{"role": "system", "content": coach_prompt}]
+        )
+        analysis = resp.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error("Weekly review error: %s", e)
+        analysis = "No pude generar el analisis esta vez."
+
+    msg = (
+        "\U0001f4ca *REVIEW SEMANAL*\n\n"
+        + stats_text
+        + "\n---\n\n"
+        + analysis
+    )
+    await send_whatsapp(MY_PHONE_NUMBER, msg)
+
+
 async def check_calendar_events():
     if not gcal.is_configured() or not MY_PHONE_NUMBER:
         return
@@ -1270,6 +1473,7 @@ async def startup():
     scheduler.add_job(tomorrow_preview, CronTrigger(hour=19, minute=0), id="tomorrow_preview")
     scheduler.add_job(evening_review, CronTrigger(hour=21, minute=0), id="evening")
     scheduler.add_job(check_overdue_nudges, IntervalTrigger(hours=1), id="nudges")
+    scheduler.add_job(weekly_review, CronTrigger(day_of_week="sun", hour=20, minute=0), id="weekly")
     if gcal.is_configured():
         scheduler.add_job(check_calendar_events, IntervalTrigger(minutes=1), id="gcal")
         scheduler.add_job(check_pending_followups, IntervalTrigger(minutes=5), id="followups")
@@ -1691,3 +1895,27 @@ async def admin_reset_timings(_: bool = Depends(admin_auth)):
     for key, _label, _desc in TIMING_LABELS:
         delete_config(key)
     return {"status": "ok"}
+
+
+@app.post("/admin/trigger-weekly")
+async def admin_trigger_weekly(_: bool = Depends(admin_auth)):
+    await weekly_review()
+    return {"status": "ok", "sent_to": MY_PHONE_NUMBER}
+
+
+@app.get("/admin/memories/stats")
+async def admin_memories_stats(_: bool = Depends(admin_auth)):
+    conn = get_db()
+    total = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+    by_role = conn.execute(
+        "SELECT role, COUNT(*) FROM memories GROUP BY role"
+    ).fetchall()
+    return {
+        "total": total,
+        "by_role": {r[0]: r[1] for r in by_role},
+    }
+
+
+@app.get("/admin/memories/search")
+async def admin_memories_search(q: str, _: bool = Depends(admin_auth)):
+    return search_memories(q, limit=10, exclude_recent=0)
