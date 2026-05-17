@@ -1740,7 +1740,13 @@ async def receive_webhook(request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "running", "version": "v3-turso", "time": datetime.now(tz).isoformat()}
+    return {
+        "status": "running",
+        "version": "v3-turso",
+        "time": datetime.now(tz).isoformat(),
+        "calendar": "configurado" if gcal.is_configured() else "no configurado",
+        "gmail": "configurado" if gmail.is_configured() else "no configurado",
+    }
 
 
 @app.get("/tasks")
