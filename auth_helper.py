@@ -1,8 +1,10 @@
 """
-auth_helper.py - Genera el refresh token de Google Calendar.
+auth_helper.py - Genera el refresh token de Google (Calendar + Gmail).
 
 Script de uso unico. Corre una sola vez para obtener el GOOGLE_REFRESH_TOKEN
-que despues vive en Railway como variable de entorno.
+que despues vive en Railway como variable de entorno. El token resultante
+cubre Calendar y lectura de Gmail con un solo valor: reemplaza al token
+viejo (solo-Calendar) sin romper nada, porque incluye ambos permisos.
 
 Uso:
     export GOOGLE_CLIENT_ID="..."
@@ -12,6 +14,10 @@ Uso:
 import os
 import sys
 
+# Google a veces devuelve los scopes en distinto orden al pedirlos; sin esto
+# oauthlib aborta con "Scope has changed" al re-autorizar con scopes nuevos.
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
+
 try:
     from google_auth_oauthlib.flow import InstalledAppFlow
 except ImportError:
@@ -20,7 +26,10 @@ except ImportError:
     sys.exit(1)
 
 
-SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
+SCOPES = [
+    "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/gmail.readonly",
+]
 
 
 def main():
@@ -45,7 +54,7 @@ def main():
     }
 
     print("=" * 60)
-    print("Auth helper - Google Calendar")
+    print("Auth helper - Google Calendar + Gmail")
     print("=" * 60)
     print()
     print("Voy a abrir tu navegador. Hace lo siguiente:")
@@ -54,7 +63,7 @@ def main():
     print("     - Click 'Configuracion avanzada' (o 'Advanced')")
     print("     - Click 'Ir a WhatsApp Assistant (no seguro)'")
     print("     Eso es esperado porque la app esta publicada pero no verificada.")
-    print("  3. Acepta los permisos de calendario")
+    print("  3. Acepta los permisos (calendario + lectura de Gmail)")
     print("  4. Vuelves aca, vas a ver el refresh_token impreso")
     print()
     input("Enter para abrir el navegador...")

@@ -19,6 +19,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from openai import OpenAI
 
 import gcal
+import gmail
 
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")
 WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID", "653078644555574")
@@ -124,6 +125,16 @@ def migrate_schema():
         "responded_at TEXT,"
         "status TEXT DEFAULT 'pending',"
         "outcome TEXT,"
+        "created_at TEXT DEFAULT (datetime('now')))"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS processed_emails ("
+        "message_id TEXT PRIMARY KEY,"
+        "from_email TEXT,"
+        "subject TEXT,"
+        "important INTEGER DEFAULT 0,"
+        "reason TEXT,"
+        "notified INTEGER DEFAULT 0,"
         "created_at TEXT DEFAULT (datetime('now')))"
     )
     conn.commit()
@@ -399,6 +410,27 @@ INVITADOS EN agendar_evento (campo attendees):
 FECHA: {{CURRENT_DATE}} ({{DAY_NAME}}) | HORA: {{CURRENT_TIME}}
 
 Para reminders: calcula fecha/hora real. 'manana a las 8' = fecha de manana 08:00. 'en 2 horas' = suma desde hora actual."""
+
+
+DEFAULT_EMAIL_CRITERIA = """Eres el filtro de correo de Christian. Tu trabajo: decidir si un correo merece interrumpirlo con una notificacion de WhatsApp, o no.
+
+Christian es CEO de dos empresas: Los Lagos (desarrollo inmobiliario) y YAVE (un CRM). Su bandeja recibe MUCHISIMO ruido automatico. Solo lo que de verdad importa debe pasar el filtro.
+
+ES IMPORTANTE (notificar):
+- Compras hechas con su tarjeta Bancolombia (debito o credito).
+- Correos de Meta/Facebook SOLO si algo sale mal: un anuncio rechazado, un problema de cobro o con la cuenta publicitaria.
+- Un correo escrito por una persona real dirigido a el: un lead, cliente, socio o proveedor.
+- Algo que pida una respuesta o accion suya, o que tenga una fecha limite.
+- Alertas de seguridad reales de sus cuentas (un acceso o cambio que no reconozca).
+
+NO ES IMPORTANTE (ignorar):
+- Newsletters, publicidad, promociones, ofertas.
+- Recibos y confirmaciones automaticas de rutina.
+- Notificaciones de redes sociales o de plataformas.
+- Correos de Meta cuando todo va bien: "anuncio aprobado", recibos de pago de publicidad.
+- Transferencias bancarias de rutina (salvo que sean por un monto inusualmente alto).
+
+ANTE LA DUDA: marca como importante. Christian prefiere recibir un aviso de mas que perderse algo."""
 
 
 def build_system_prompt(query_text=None):
@@ -1461,6 +1493,121 @@ async def check_overdue_nudges():
         increment_nudge_count(t["id"])
 
 
+def classify_email(email):
+    """Clasifica un correo como importante o no, segun el criterio editable.
+    Devuelve {"important": bool, "reason": str}, o None si la clasificacion
+    falla (para reintentarla en el proximo ciclo en vez de descartarla)."""
+    criterio = get_config("email_importance_criteria", DEFAULT_EMAIL_CRITERIA)
+    sys_prompt = (
+        criterio + "\n\n"
+        "Responde SOLO con JSON valido, sin markdown ni backticks:\n"
+        '{"important": true o false, "reason": "por que, en espanol, max 12 palabras"}'
+    )
+    user_msg = (
+        "De: " + (email.get("from_name") or "") + " <" + (email.get("from_email") or "") + ">\n"
+        "Asunto: " + (email.get("subject") or "") + "\n"
+        "Resumen: " + (email.get("snippet") or "")
+    )
+    try:
+        resp = openai_client.chat.completions.create(
+            model="gpt-5.4-mini",
+            max_completion_tokens=150,
+            temperature=0.7,
+            messages=[
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_msg},
+            ],
+        )
+        raw = resp.choices[0].message.content.strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        parsed = json.loads(raw)
+        return {
+            "important": bool(parsed.get("important", False)),
+            "reason": str(parsed.get("reason", "")).strip(),
+        }
+    except Exception as e:
+        logger.error("classify_email error: %s", e)
+        return None
+
+
+def get_processed_email_ids(ids):
+    """De una lista de message_ids, devuelve el set de los que ya estan en la DB."""
+    if not ids:
+        return set()
+    conn = get_db()
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        "SELECT message_id FROM processed_emails WHERE message_id IN (" + placeholders + ")",
+        tuple(ids),
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
+def processed_emails_count():
+    conn = get_db()
+    return conn.execute("SELECT COUNT(*) FROM processed_emails").fetchone()[0]
+
+
+def save_processed_email(email, important, reason, notified):
+    conn = get_db()
+    conn.execute(
+        "INSERT OR IGNORE INTO processed_emails "
+        "(message_id, from_email, subject, important, reason, notified) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (email.get("id"), email.get("from_email"), email.get("subject"),
+         1 if important else 0, reason, 1 if notified else 0),
+    )
+    conn.commit()
+
+
+def format_email_alert(email, reason):
+    sender = email.get("from_name") or email.get("from_email") or "?"
+    msg = "\U0001f4e7 *Correo importante*\n\n"
+    msg = msg + "De: *" + sender + "*\n"
+    msg = msg + "Asunto: " + (email.get("subject") or "(sin asunto)")
+    if reason:
+        msg = msg + "\n\n_" + reason + "_"
+    return msg
+
+
+async def check_new_emails():
+    if not gmail.is_configured() or not MY_PHONE_NUMBER:
+        return
+    service = gmail.get_gmail_service()
+    if not service:
+        return
+    ids = gmail.list_message_ids(service, "in:inbox newer_than:1d", 40)
+    if not ids:
+        return
+    already = get_processed_email_ids(ids)
+    new_ids = [i for i in ids if i not in already]
+    if not new_ids:
+        return
+
+    # Primera corrida: sembrar el inbox actual sin notificar, para no
+    # reenviar correos viejos. Solo se avisa de los que lleguen despues.
+    if processed_emails_count() == 0:
+        for mid in new_ids:
+            save_processed_email({"id": mid}, important=False, reason="(seed)", notified=False)
+        logger.info("check_new_emails: %d correos sembrados (primera corrida)", len(new_ids))
+        return
+
+    for mid in new_ids:
+        email = gmail.get_email(service, mid)
+        if not email:
+            continue
+        result = classify_email(email)
+        if result is None:
+            continue  # error de clasificacion: se reintenta en el proximo ciclo
+        important = result["important"]
+        reason = result["reason"]
+        notified = False
+        if important:
+            await send_whatsapp(MY_PHONE_NUMBER, format_email_alert(email, reason))
+            notified = True
+        save_processed_email(email, important, reason, notified)
+
+
 app = FastAPI(title="Asistente Personal WhatsApp v3")
 
 
@@ -1480,6 +1627,11 @@ async def startup():
         logger.info("Google Calendar: configurado")
     else:
         logger.warning("Google Calendar: NO configurado (faltan env vars GOOGLE_*)")
+    if gmail.is_configured():
+        scheduler.add_job(check_new_emails, IntervalTrigger(minutes=2), id="gmail")
+        logger.info("Gmail: configurado")
+    else:
+        logger.warning("Gmail: NO configurado (falta el scope de Gmail en GOOGLE_REFRESH_TOKEN)")
     scheduler.start()
     logger.info("Asistente Personal v3 iniciado - Turso DB")
 
@@ -1901,6 +2053,14 @@ async def admin_reset_timings(_: bool = Depends(admin_auth)):
 async def admin_trigger_weekly(_: bool = Depends(admin_auth)):
     await weekly_review()
     return {"status": "ok", "sent_to": MY_PHONE_NUMBER}
+
+
+@app.post("/admin/trigger-emails")
+async def admin_trigger_emails(_: bool = Depends(admin_auth)):
+    if not gmail.is_configured():
+        return {"status": "gmail no configurado"}
+    await check_new_emails()
+    return {"status": "ok"}
 
 
 @app.get("/admin/memories/stats")
