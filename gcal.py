@@ -104,7 +104,7 @@ def list_events_next_hours(hours_ahead: int = 24) -> list:
         return []
 
 
-def list_events_tomorrow() -> list:
+def list_events_tomorrow(include_all_day: bool = True) -> list:
     service = get_calendar_service()
     if not service:
         return []
@@ -124,6 +124,8 @@ def list_events_tomorrow() -> list:
             maxResults=30,
         ).execute()
         events = result.get("items", [])
+        if include_all_day:
+            return events
         return [e for e in events if "dateTime" in e.get("start", {})]
     except HttpError as e:
         logger.error("gcal list_tomorrow error: %s", e)
@@ -131,6 +133,108 @@ def list_events_tomorrow() -> list:
     except Exception as e:
         logger.error("gcal list_tomorrow unexpected error: %s", e)
         return []
+
+
+def list_events_on_date(date_str: str, include_all_day: bool = True) -> list:
+    """Eventos de un dia concreto. date_str en formato YYYY-MM-DD."""
+    service = get_calendar_service()
+    if not service:
+        return []
+    tz = ZoneInfo(GOOGLE_TIMEZONE)
+    try:
+        day = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=tz)
+    except ValueError:
+        logger.error("gcal list_on_date: fecha invalida %s", date_str)
+        return []
+    day_start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end = day_start + timedelta(days=1)
+    try:
+        result = service.events().list(
+            calendarId=GOOGLE_CALENDAR_ID,
+            timeMin=day_start.isoformat(),
+            timeMax=day_end.isoformat(),
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=30,
+        ).execute()
+        events = result.get("items", [])
+        if include_all_day:
+            return events
+        return [e for e in events if "dateTime" in e.get("start", {})]
+    except Exception as e:
+        logger.error("gcal list_on_date error: %s", e)
+        return []
+
+
+def find_events(query: str, days_ahead: int = 30) -> list:
+    """Busca eventos proximos cuyo titulo contenga `query` (case-insensitive)."""
+    service = get_calendar_service()
+    if not service or not query.strip():
+        return []
+    tz = ZoneInfo(GOOGLE_TIMEZONE)
+    now = datetime.now(tz)
+    try:
+        result = service.events().list(
+            calendarId=GOOGLE_CALENDAR_ID,
+            timeMin=now.isoformat(),
+            timeMax=(now + timedelta(days=days_ahead)).isoformat(),
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=100,
+        ).execute()
+        q = query.lower().strip()
+        return [e for e in result.get("items", []) if q in e.get("summary", "").lower()]
+    except Exception as e:
+        logger.error("gcal find_events error: %s", e)
+        return []
+
+
+def update_event(event_id, summary=None, start_iso=None, end_iso=None) -> Optional[dict]:
+    """Actualiza (patch) un evento. Solo modifica los campos provistos."""
+    service = get_calendar_service()
+    if not service:
+        return None
+    body = {}
+    if summary:
+        body["summary"] = summary
+    if start_iso:
+        body["start"] = {"dateTime": start_iso, "timeZone": GOOGLE_TIMEZONE}
+    if end_iso:
+        body["end"] = {"dateTime": end_iso, "timeZone": GOOGLE_TIMEZONE}
+    if not body:
+        return None
+    try:
+        return service.events().patch(
+            calendarId=GOOGLE_CALENDAR_ID,
+            eventId=event_id,
+            body=body,
+            sendUpdates="all",
+        ).execute()
+    except HttpError as e:
+        logger.error("gcal update_event error: %s", e)
+        return None
+    except Exception as e:
+        logger.error("gcal update_event unexpected error: %s", e)
+        return None
+
+
+def delete_event(event_id) -> bool:
+    service = get_calendar_service()
+    if not service:
+        return False
+    try:
+        service.events().delete(
+            calendarId=GOOGLE_CALENDAR_ID,
+            eventId=event_id,
+            sendUpdates="all",
+        ).execute()
+        return True
+    except HttpError as e:
+        logger.error("gcal delete_event error: %s", e)
+        return False
+    except Exception as e:
+        logger.error("gcal delete_event unexpected error: %s", e)
+        return False
 
 
 def is_event_active_now() -> bool:
@@ -259,6 +363,29 @@ def format_event_for_reminder(event: dict, notification_type: str) -> str:
     return msg
 
 
+def is_all_day(event: dict) -> bool:
+    start = event.get("start", {})
+    return "date" in start and "dateTime" not in start
+
+
+def format_event_oneline(event: dict) -> str:
+    """Resumen de una linea para desambiguar eventos. Maneja all-day."""
+    title = event.get("summary", "(sin titulo)")
+    start = event.get("start", {})
+    when = ""
+    if "dateTime" in start:
+        try:
+            when = datetime.fromisoformat(start["dateTime"]).strftime("%d/%m %H:%M")
+        except Exception:
+            when = start.get("dateTime", "")
+    elif "date" in start:
+        try:
+            when = datetime.strptime(start["date"], "%Y-%m-%d").strftime("%d/%m") + " (todo el dia)"
+        except Exception:
+            when = start.get("date", "")
+    return (when + " - " if when else "") + title
+
+
 def format_event_for_daily_preview(event: dict) -> str:
     title = event.get("summary", "(sin titulo)")
     location = event.get("location", "")
@@ -267,17 +394,20 @@ def format_event_for_daily_preview(event: dict) -> str:
     attendees = event.get("attendees", []) or []
 
     time_str = ""
-    try:
-        start_dt = datetime.fromisoformat(start_str)
-        start_time = start_dt.strftime("%H:%M")
-        time_str = start_time
+    if is_all_day(event):
+        time_str = "todo el dia"
+    else:
         try:
-            end_dt = datetime.fromisoformat(end_str)
-            time_str = start_time + "-" + end_dt.strftime("%H:%M")
+            start_dt = datetime.fromisoformat(start_str)
+            start_time = start_dt.strftime("%H:%M")
+            time_str = start_time
+            try:
+                end_dt = datetime.fromisoformat(end_str)
+                time_str = start_time + "-" + end_dt.strftime("%H:%M")
+            except Exception:
+                pass
         except Exception:
             pass
-    except Exception:
-        pass
 
     line = "• "
     if time_str:

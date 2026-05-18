@@ -329,6 +329,7 @@ QUE PUEDES HACER:
 7. Agendar eventos en Google Calendar, avisar antes (T-30/T-10/T-2/T-0) y hacer follow-up 30 min despues del fin
 8. Marcar como completada (complete), descartar sin hacer (kill) o posponer (postpone) tareas existentes
 9. Insistir solo (proactivamente) con tareas vencidas: el sistema te muestra cuantos recordatorios lleva cada una y cuantas veces se pospuso
+10. Consultar la agenda de un dia (listar_eventos), editar un evento ya agendado (editar_evento) y cancelarlo (cancelar_evento)
 
 COMPORTAMIENTO PROACTIVO (importante para interpretar el historial):
 - Tu envias mensajes solo (sin que Christian escriba) en 3 casos: avisos pre-evento, follow-up post-evento ("¿se dio? ¿que quedo pendiente?") y recordatorios de tareas vencidas.
@@ -352,6 +353,9 @@ INTENTS POSIBLES:
 - postpone: cuando POSTERGA una tarea existente para otro dia (detecta: "lo hago mañana", "el viernes lo veo", "mas tarde", "lo dejo para X dia"). Identifica de cual tarea pendiente esta hablando y calcula la nueva fecha. NO uses postpone para tareas nuevas - solo para mover tareas ya en la lista.
 - learn: cuando te ENSENA algo sobre el o sus proyectos (detecta: "recuerda que", "mi prioridad es", "ten en cuenta", "aprende que", "esto es importante")
 - agendar_evento: cuando quiere AGENDAR algo en su CALENDARIO de Google (detecta: "agendame", "agrega al calendario", "pon una reunion", "tengo una cita", "reserva X dia"). Distinto de reminder: agendar_evento crea evento en Google Calendar; reminder es solo un mensaje.
+- listar_eventos: cuando PREGUNTA por su agenda/calendario (detecta: "que tengo hoy", "que reuniones tengo", "que hay manana", "mi agenda del viernes", "que tengo agendado"). Calcula el dia concreto en formato YYYY-MM-DD. Distinto de query: query es sobre tareas/ideas, listar_eventos es sobre eventos del calendario.
+- editar_evento: cuando quiere CAMBIAR un evento ya agendado (detecta: "muevelo a las 4", "cambia la reunion al jueves", "pasa la cita a las 10", "reagenda", "que dure 30 min", "renombra el evento"). Identifica el evento por su titulo (search_term) y extrae solo los campos que cambian; deja en null los que no.
+- cancelar_evento: cuando quiere CANCELAR o BORRAR un evento del calendario (detecta: "cancela la reunion con Juan", "borra el evento", "elimina la cita"). Distinto de kill: kill es para tareas, cancelar_evento para eventos del calendario.
 - event_followup_response: SOLO cuando en la conversacion reciente TU (asistente) hiciste una pregunta del tipo "Tu reunion X termino hace ~30 min. ¿Se dio? ¿Que quedo pendiente?" y el usuario esta respondiendo a esa pregunta especifica. Detecta outcome (si la reunion ocurrio o no) y extrae los pendientes que menciona.
 - redactar: cuando quiere AYUDA PARA ESCRIBIR un mensaje a alguien (detecta: "ayudame a escribirle", "como le digo a", "que le respondo a", "redactame", "escribirle a", "mensaje para"). Genera 3 variaciones en SU voz (amigable colombiano informal, directo, calido, nunca corporativo).
 - chat: conversacion normal, consejo, ayuda para pensar
@@ -366,6 +370,9 @@ kill: {"search_term":"texto para buscar la tarea"}
 postpone: {"search_term":"texto para buscar la tarea","new_due_date":"YYYY-MM-DD"}
 learn: {"key":"tema corto","value":"lo que debe recordar"}
 agendar_evento: {"title":"corto","start_date":"YYYY-MM-DD","start_time":"HH:MM","duration_minutes":60,"description":"opcional o null","attendees":["email1@x.com","email2@y.com"] o []}
+listar_eventos: {"day":"YYYY-MM-DD"}
+editar_evento: {"search_term":"texto del titulo del evento a buscar","new_date":"YYYY-MM-DD o null","new_start_time":"HH:MM o null","new_duration_minutes":numero o null,"new_title":"nuevo titulo o null"}
+cancelar_evento: {"search_term":"texto del titulo del evento a buscar"}
 event_followup_response: {"outcome":"happened|didnt_happen|unknown","pending_tasks":["titulo corto 1","titulo corto 2"]}
 redactar: {"destinatario":"para quien es el mensaje","contexto":"que quiere comunicar","variaciones":["v1 mas corta/directa","v2 mas calida","v3 alternativa"]}
 chat: {}
@@ -875,6 +882,16 @@ def expire_stale_event_followups(hours=4):
     conn.commit()
 
 
+def cancel_event_followups(event_id):
+    conn = get_db()
+    conn.execute(
+        "UPDATE event_followups SET status='cancelled' "
+        "WHERE event_id=? AND status IN ('pending', 'sent')",
+        (event_id,)
+    )
+    conn.commit()
+
+
 P_EMOJI = {"alta": "\U0001f534", "media": "\U0001f7e1", "baja": "\U0001f7e2"}
 C_EMOJI = {"yave": "\U0001f916", "loslagos": "\U0001f3e1", "personal": "\U0001f464", "general": "\U0001f4cc"}
 
@@ -954,6 +971,61 @@ async def transcribe_audio(media_id):
     return transcript.text
 
 
+def _build_event_patch(event, data):
+    """Calcula (summary, start_iso, end_iso) para gcal.update_event.
+
+    Conserva la duracion del evento salvo que se pida una nueva. Devuelve None
+    si no hay nada que cambiar o si la fecha/hora no se puede aplicar.
+    """
+    new_title = (data.get("new_title") or "").strip() or None
+    new_date = (data.get("new_date") or "").strip()
+    new_time = (data.get("new_start_time") or "").strip()
+    new_dur = data.get("new_duration_minutes")
+
+    start_str = event.get("start", {}).get("dateTime", "")
+    end_str = event.get("end", {}).get("dateTime", "")
+
+    # Evento de dia completo: solo se le puede cambiar el titulo.
+    if not start_str:
+        return (new_title, None, None) if new_title else None
+
+    if not (new_date or new_time or new_dur):
+        return (new_title, None, None) if new_title else None
+
+    try:
+        cur_start = datetime.fromisoformat(start_str)
+        cur_end = datetime.fromisoformat(end_str) if end_str else cur_start + timedelta(hours=1)
+    except Exception:
+        return None
+
+    target_date = cur_start.date()
+    if new_date:
+        try:
+            target_date = datetime.strptime(new_date, "%Y-%m-%d").date()
+        except ValueError:
+            pass
+
+    target_time = cur_start.timetz()
+    if new_time:
+        try:
+            target_time = datetime.strptime(new_time, "%H:%M").time().replace(tzinfo=cur_start.tzinfo)
+        except ValueError:
+            pass
+
+    new_start = datetime.combine(target_date, target_time)
+    if new_start.tzinfo is None:
+        new_start = new_start.replace(tzinfo=tz)
+
+    duration = cur_end - cur_start
+    if new_dur:
+        try:
+            duration = timedelta(minutes=int(new_dur))
+        except (ValueError, TypeError):
+            pass
+
+    return (new_title, new_start.isoformat(), (new_start + duration).isoformat())
+
+
 async def process_message(phone, text):
     lower = text.strip().lower()
 
@@ -976,6 +1048,10 @@ async def process_message(phone, text):
             "- _Idea: hacer webinar de YAVE_\n"
             "- _Recuerdame a las 3pm revisar metricas_\n"
             "- _Ya hice lo de Juan_\n\n"
+            "*Calendario:*\n"
+            "- _Agenda reunion con Juan el jueves 10am_\n"
+            "- _Que tengo manana_\n"
+            "- _Muevela a las 4pm_ / _Cancela la reunion con Juan_\n\n"
             "*Ensenami cosas:*\n"
             "- _Recuerda que mi prioridad es cerrar 3 ventas_\n"
             "- _Ten en cuenta que el lanzamiento es en abril_\n\n"
@@ -1166,6 +1242,86 @@ async def process_message(phone, text):
                 msg = msg + "\n\n" + response_text
             await send_whatsapp(phone, msg)
 
+    elif intent == "listar_eventos":
+        if not gcal.is_configured():
+            await send_whatsapp(phone, "Google Calendar no esta configurado todavia.")
+        else:
+            day = (data.get("day") or "").strip() or datetime.now(tz).strftime("%Y-%m-%d")
+            try:
+                d = datetime.strptime(day, "%Y-%m-%d")
+                day_label = _DIAS_ES[d.weekday()] + " " + d.strftime("%d/%m")
+            except ValueError:
+                day_label = day
+            events = gcal.list_events_on_date(day)
+            if not events:
+                msg = "\U0001f4c5 " + day_label + ": no tienes nada agendado."
+                if response_text:
+                    msg = msg + "\n\n" + response_text
+                await send_whatsapp(phone, msg)
+            else:
+                lines = ["\U0001f4c5 *Agenda " + day_label + "* (" + str(len(events)) + ")", ""]
+                for e in events:
+                    lines.append(gcal.format_event_for_daily_preview(e))
+                msg = "\n".join(lines)
+                if response_text:
+                    msg = msg + "\n\n" + response_text
+                await send_whatsapp(phone, msg)
+
+    elif intent == "editar_evento":
+        if not gcal.is_configured():
+            await send_whatsapp(phone, "Google Calendar no esta configurado todavia.")
+        else:
+            search = (data.get("search_term") or "").strip()
+            matches = gcal.find_events(search) if search else []
+            if not matches:
+                await send_whatsapp(phone, "\U0001f50d No encontre ese evento en tu calendario.")
+            elif len(matches) > 1:
+                lines = ["\U0001f914 Varios eventos coinciden:"]
+                for e in matches[:6]:
+                    lines.append("• " + gcal.format_event_oneline(e))
+                lines.append("\nSe mas especifico.")
+                await send_whatsapp(phone, "\n".join(lines))
+            else:
+                event = matches[0]
+                patch = _build_event_patch(event, data)
+                if not patch:
+                    await send_whatsapp(phone, "Dime que quieres cambiarle al evento: hora, fecha, duracion o titulo.")
+                else:
+                    summary, start_iso, end_iso = patch
+                    updated = gcal.update_event(event["id"], summary=summary, start_iso=start_iso, end_iso=end_iso)
+                    if updated:
+                        msg = "✏️ Evento actualizado:\n" + gcal.format_event_for_creation(updated)
+                        if response_text:
+                            msg = msg + "\n\n" + response_text
+                        await send_whatsapp(phone, msg)
+                    else:
+                        await send_whatsapp(phone, "Hubo un error actualizando el evento. Intenta de nuevo.")
+
+    elif intent == "cancelar_evento":
+        if not gcal.is_configured():
+            await send_whatsapp(phone, "Google Calendar no esta configurado todavia.")
+        else:
+            search = (data.get("search_term") or "").strip()
+            matches = gcal.find_events(search) if search else []
+            if not matches:
+                await send_whatsapp(phone, "\U0001f50d No encontre ese evento en tu calendario.")
+            elif len(matches) > 1:
+                lines = ["\U0001f914 Varios eventos coinciden:"]
+                for e in matches[:6]:
+                    lines.append("• " + gcal.format_event_oneline(e))
+                lines.append("\nSe mas especifico.")
+                await send_whatsapp(phone, "\n".join(lines))
+            else:
+                event = matches[0]
+                if gcal.delete_event(event["id"]):
+                    cancel_event_followups(event["id"])
+                    msg = "\U0001f5d1 Evento cancelado: *" + event.get("summary", "(sin titulo)") + "*"
+                    if response_text:
+                        msg = msg + "\n\n" + response_text
+                    await send_whatsapp(phone, msg)
+                else:
+                    await send_whatsapp(phone, "Hubo un error cancelando el evento. Intenta de nuevo.")
+
     else:
         await send_whatsapp(phone, response_text)
 
@@ -1193,6 +1349,17 @@ async def morning_summary():
         msg = msg + "\n\n\U0001f3af *FOCUS HOY:*"
         for t in high[:3]:
             msg = msg + "\n  " + C_EMOJI.get(t["category"], "\U0001f4cc") + " " + t["title"]
+
+    if gcal.is_configured():
+        try:
+            today_events = gcal.list_events_on_date(datetime.now(tz).strftime("%Y-%m-%d"))
+        except Exception as e:
+            logger.error("morning_summary events error: %s", e)
+            today_events = []
+        if today_events:
+            msg = msg + "\n\n\U0001f4c5 *AGENDA HOY:*"
+            for e in today_events:
+                msg = msg + "\n" + gcal.format_event_for_daily_preview(e)
 
     priority = ctx.get("prioridad_semana", ctx.get("prioridad", ""))
     if priority:
