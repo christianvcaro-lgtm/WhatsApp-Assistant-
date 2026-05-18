@@ -73,6 +73,13 @@ git push -u origin main
 |`GOOGLE_TIMEZONE`       |Zona horaria del calendario (default `America/Bogota`)|
 |`GOOGLE_CALENDAR_ID`    |ID del calendario a usar (default `primary`)       |
 
+**Obsidian (opcional — espejo de tareas/ideas/recordatorios en un vault):**
+
+|Variable        |Valor                                                  |
+|-----------------|-------------------------------------------------------|
+|`GITHUB_TOKEN`   |Token de GitHub con acceso al repo del vault           |
+|`VAULT_REPO`     |Repo del vault, formato `usuario/repo`                 |
+
 1. Railway despliega automáticamente. Copia la URL que te da (ej: `https://tu-app.up.railway.app`)
 
 ### 3. Configurar Webhook en Meta
@@ -110,12 +117,33 @@ whatsapp-assistant/
 ├── app.py              # Núcleo del bot (servidor + lógica + DB + scheduler)
 ├── gcal.py             # Integración con Google Calendar
 ├── gmail.py            # Integración con Gmail (filtro de correos)
+├── obsidian.py         # Integración con un vault de Obsidian en GitHub
 ├── auth_helper.py      # Genera el GOOGLE_REFRESH_TOKEN (OAuth)
 ├── requirements.txt    # Dependencias Python
 ├── Procfile            # Comando de inicio para Railway
 ├── TODO.md             # Backlog de mejoras
 └── README.md           # Este archivo
 ```
+
+## Vault de Obsidian (opcional)
+
+Si configuras `GITHUB_TOKEN` y `VAULT_REPO`, el bot escribe cada tarea, idea,
+recordatorio y nota de contexto como un archivo markdown en un repo de GitHub
+que hace de vault de Obsidian. Al completar o descartar una tarea, actualiza
+el `estado:` en su nota.
+
+Para conectarlo:
+
+1. Crea un repo **privado** en GitHub para tu vault (ej: `tu-usuario/obsidian-vault`).
+2. En Obsidian, instala el community plugin **Obsidian Git** y apúntalo a ese
+   repo. El plugin hace commit/push automático de tus cambios y pull de los del
+   bot, así PC y bot comparten las mismas notas.
+3. Genera un **Personal Access Token** de GitHub con permiso de escritura sobre
+   ese repo y ponlo en `GITHUB_TOKEN`.
+4. Pon `usuario/repo` del vault en `VAULT_REPO`.
+
+El bot organiza las notas en carpetas: `tareas`, `inbox`, `recordatorios`,
+`contexto`, `proyectos/los-lagos` y `proyectos/yave`.
 
 > La base de datos es **Turso** (libsql) remota, configurada vía `TURSO_URL` y `TURSO_TOKEN`. No hay archivo SQLite local.
 

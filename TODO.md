@@ -16,14 +16,22 @@ Pendiente:
 - Al editar un evento, re-sincronizar el `event_followup` asociado (hoy el
   follow-up post-evento sigue agendado segun la hora de fin original).
 
-## Obsidian — siguiente fase tras Calendar
+## Obsidian
 
-- Restaurar integracion con vault de Obsidian. El codigo fue eliminado en
-  commit `703bc31`, recuperable completo en commit `536065b` (incluye
-  push_to_vault, sync_vault_to_db, parse_frontmatter, etc.)
-- Decidir: restaurar tal cual vs reescribir adaptado al schema Turso actual
-- Confirmar estructura de carpetas previa: `proyectos/los-lagos`,
-  `proyectos/yave`, `tareas`, `inbox`, `recordatorios`, `contexto`
+Hecho: integracion de ESCRITURA restaurada en el modulo `obsidian.py`. El bot
+escribe cada tarea/idea/recordatorio/contexto como nota markdown en un repo de
+GitHub que hace de vault, y actualiza el `estado:` al completar o descartar
+tareas. Se activa con las env vars `GITHUB_TOKEN` y `VAULT_REPO`.
+
+Pendiente — lado de LECTURA:
+
+- El `sync_vault_to_db` viejo (importar notas del vault a la DB en cada
+  arranque) NO se restauro: con la DB persistente de Turso su dedup por
+  titulo+fecha genera duplicados (la fecha local del frontmatter no coincide
+  con el `created_at` en UTC). Necesita rediseno.
+- Opcion mas liviana propuesta: en vez de auto-importar todo, un intent para
+  consultar el vault bajo demanda ("busca en mis notas X"), sin volcar nada a
+  las tablas. Evita duplicados y no carga el vault entero en el prompt.
 
 ## Autonomia — fase 2 (ejecutar con confirmacion)
 

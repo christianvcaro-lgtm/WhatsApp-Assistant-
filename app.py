@@ -20,6 +20,7 @@ from openai import OpenAI
 
 import gcal
 import gmail
+import obsidian
 
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")
 WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID", "653078644555574")
@@ -1073,6 +1074,7 @@ async def process_message(phone, text):
         if response_text and response_text != data.get("title", ""):
             msg = msg + "\n\n" + response_text
         await send_whatsapp(phone, msg)
+        await obsidian.capture_task(tid, data)
 
     elif intent == "idea":
         iid = add_idea(data)
@@ -1080,6 +1082,7 @@ async def process_message(phone, text):
         if response_text and response_text != data.get("content", ""):
             msg = msg + "\n\n" + response_text
         await send_whatsapp(phone, msg)
+        await obsidian.capture_idea(iid, data)
 
     elif intent == "reminder":
         rid = add_reminder(data)
@@ -1087,6 +1090,7 @@ async def process_message(phone, text):
         if response_text:
             msg = msg + "\n\n" + response_text
         await send_whatsapp(phone, msg)
+        await obsidian.capture_reminder(rid, data)
 
     elif intent == "query":
         qt = data.get("query_type", "pending_tasks")
@@ -1115,6 +1119,7 @@ async def process_message(phone, text):
             if response_text:
                 msg = msg + "\n\n" + response_text
             await send_whatsapp(phone, msg)
+            await obsidian.mark_task_completed(found)
         else:
             await send_whatsapp(phone, "\U0001f50d No encontre esa tarea. Escribe *pendientes* para ver la lista.")
 
@@ -1128,6 +1133,7 @@ async def process_message(phone, text):
             if response_text:
                 msg = msg + "\n\n" + response_text
             await send_whatsapp(phone, msg)
+            await obsidian.mark_task_killed(found)
         else:
             await send_whatsapp(phone, "\U0001f50d No encontre esa tarea para descartar.")
 
@@ -1154,6 +1160,7 @@ async def process_message(phone, text):
         if key and value:
             set_context(key, value)
             await send_whatsapp(phone, "\U0001f9e0 Listo, me lo guarde.\n\n" + response_text)
+            await obsidian.capture_context(key, value)
         else:
             await send_whatsapp(phone, response_text)
 
@@ -1799,6 +1806,10 @@ async def startup():
         logger.info("Gmail: configurado")
     else:
         logger.warning("Gmail: NO configurado (falta el scope de Gmail en GOOGLE_REFRESH_TOKEN)")
+    if obsidian.is_configured():
+        logger.info("Obsidian vault: configurado (%s)", obsidian.VAULT_REPO)
+    else:
+        logger.warning("Obsidian vault: NO configurado (faltan env vars GITHUB_TOKEN / VAULT_REPO)")
     scheduler.start()
     logger.info("Asistente Personal v3 iniciado - Turso DB")
 
