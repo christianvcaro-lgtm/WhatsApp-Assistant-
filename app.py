@@ -113,6 +113,19 @@ def migrate_schema():
     for col_name, col_def in new_task_columns:
         if not _column_exists(conn, "tasks", col_name):
             conn.execute("ALTER TABLE tasks ADD COLUMN " + col_name + " " + col_def)
+    new_reminder_columns = [
+        ("kind", "TEXT DEFAULT 'once'"),
+        ("days", "TEXT"),
+        ("time_of_day", "TEXT"),
+        ("repeat_minutes", "INTEGER"),
+        ("state", "TEXT DEFAULT 'idle'"),
+        ("last_fired_at", "TEXT"),
+        ("nagging_since", "TEXT"),
+        ("active", "INTEGER DEFAULT 1"),
+    ]
+    for col_name, col_def in new_reminder_columns:
+        if not _column_exists(conn, "reminders", col_name):
+            conn.execute("ALTER TABLE reminders ADD COLUMN " + col_name + " " + col_def)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS event_followups ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -281,11 +294,42 @@ TIMING_DEFAULTS = {
     "nudge_cap_per_task": 5,
     "followup_no_response_hours": 4,
     "message_buffer_seconds": 5,
+    "nag_max_minutes": 60,
 }
 
 
 def get_timing(key):
     return get_int_config(key, TIMING_DEFAULTS[key])
+
+
+# Margen (segundos) para disparar un recordatorio recurrente aunque el
+# server haya estado caido en el minuto exacto. Pasado este margen, ese
+# dia se pierde (un recordatorio de las 9am no sirve a mediodia).
+RECURRING_CATCHUP_SECONDS = 600
+
+_DOW_TOKENS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+_DOW_LABEL = {"mon": "lun", "tue": "mar", "wed": "mie", "thu": "jue",
+              "fri": "vie", "sat": "sab", "sun": "dom"}
+
+# Palabras con las que Christian apaga la insistencia de un recordatorio.
+ACK_WORDS = {
+    "ok", "okay", "okey", "oka", "vale", "listo", "ya", "ya esta",
+    "ya está", "ya quedo", "ya quedó", "hecho", "dale", "perfecto",
+    "ya lo hice", "👍", "ok ya",
+}
+
+
+def _describe_days(days):
+    norm = [d for d in _DOW_TOKENS if d in (days or [])]
+    if len(norm) == 7:
+        return "todos los dias"
+    if norm == ["mon", "tue", "wed", "thu", "fri"]:
+        return "lun a vie"
+    if norm == ["sat", "sun"]:
+        return "fines de semana"
+    if not norm:
+        return "(sin dias)"
+    return ", ".join(_DOW_LABEL[d] for d in norm)
 
 
 DEFAULT_PROMPT_BODY = """Eres el asistente personal de Christian. No eres un bot generico, eres SU asistente. Conoces sus proyectos, sus prioridades, su forma de pensar. Te habla por WhatsApp en espanol colombiano informal.
@@ -309,7 +353,7 @@ TU PERSONALIDAD:
 - Si no entiendes algo, preguntas. No asumes.
 
 QUE PUEDES HACER:
-1. Guardar tareas, ideas, recordatorios
+1. Guardar tareas, ideas y recordatorios (puntuales o recurrentes; pueden insistir hasta que confirmes)
 2. Dar resumen del dia, pendientes, ideas
 3. Recordar informacion personal que Christian te ensene
 4. Ayudar a pensar, priorizar, decidir
@@ -320,7 +364,7 @@ QUE PUEDES HACER:
 9. Insistir solo (proactivamente) con tareas vencidas: el sistema te muestra cuantos recordatorios lleva cada una y cuantas veces se pospuso
 
 COMPORTAMIENTO PROACTIVO (importante para interpretar el historial):
-- Tu envias mensajes solo (sin que Christian escriba) en 3 casos: avisos pre-evento, follow-up post-evento ("¿se dio? ¿que quedo pendiente?") y recordatorios de tareas vencidas.
+- Tu envias mensajes solo (sin que Christian escriba) en estos casos: avisos pre-evento, follow-up post-evento ("¿se dio? ¿que quedo pendiente?"), recordatorios de tareas vencidas, y recordatorios programados (puntuales o recurrentes) que Christian configuro.
 - En el conversation history puedes ver mensajes tuyos sin un mensaje previo del usuario - esos son proactivos.
 - Si tu ultimo mensaje fue un follow-up post-evento y Christian responde, usa intent event_followup_response (no chat, no task).
 - Si Christian responde a un recordatorio proactivo de tarea con "lo hago mañana / el viernes / mas tarde", usa intent postpone (no chat).
@@ -334,7 +378,9 @@ Estructura:
 INTENTS POSIBLES:
 - task: cuando quiere agregar algo que HACER (detecta: "tengo que", "necesito", "hay que", "pendiente", "hacer", "tarea")
 - idea: cuando tiene una IDEA (detecta: "idea", "se me ocurrio", "que tal si", "podriamos")
-- reminder: cuando quiere un RECORDATORIO (detecta: "recuerdame", "no se me olvide", "avisame", "a las X")
+- reminder: cuando quiere un RECORDATORIO, puntual o recurrente (detecta: "recuerdame", "no se me olvide", "avisame", "a las X", "todos los dias", "cada lunes", "de lunes a viernes", "entre semana"). Puede pedir que le insistas hasta que confirme.
+- ack_reminder: cuando hay un RECORDATORIO ACTIVO ESPERANDO TU OK (lo veras en el contexto al final del prompt) y Christian responde confirmando que ya lo hizo o pidiendo que pares (detecta: "ok", "listo", "ya", "hecho", "dale", "ya quedo", "ya lo hice"). Apaga la insistencia.
+- cancel_reminder: cuando quiere DESACTIVAR un recordatorio recurrente ya creado (detecta: "ya no me recuerdes", "cancela el recordatorio de", "quita el recordatorio de", "para de recordarme").
 - query: cuando PREGUNTA por sus cosas (detecta: "que tengo", "que tareas tengo", "que pendientes tengo", "pendientes", "resumen", "como voy", "mis tareas", "muestrame mis", "muestra mis", "lista", "cuales son", "que hay")
 - complete: cuando COMPLETO algo (detecta: "listo", "hecho", "ya hice", "termine")
 - kill: cuando quiere DESCARTAR una tarea sin haberla hecho (detecta: "olvidalo", "ya no", "matala", "borra eso", "descarta", "cancelala", "quitala"). Marca la tarea como killed sin completarla.
@@ -348,8 +394,10 @@ INTENTS POSIBLES:
 DATA POR INTENT:
 task: {"title":"corto","description":"detalle o null","priority":"alta|media|baja","category":"yave|loslagos|personal|general","due_date":"YYYY-MM-DD o null"}
 idea: {"content":"la idea completa","category":"yave|loslagos|personal|general","tags":["tag1"]}
-reminder: {"message":"que recordar","remind_at":"YYYY-MM-DD HH:MM"}
-query: {"query_type":"pending_tasks|ideas|today|overdue|category","category":"DEBE ser null por DEFAULT. Solo poner yave|loslagos|personal|general SI la pregunta menciona EXPLICITAMENTE ese proyecto. Ejemplo: 'que tareas tengo' -> category null. 'que tareas tengo de yave' -> category yave."}
+reminder: {"message":"que recordar","kind":"once o recurring","remind_at":"YYYY-MM-DD HH:MM (SOLO si kind=once)","days":["mon","tue","wed","thu","fri","sat","sun"] con SOLO los dias que apliquen (SOLO si kind=recurring),"time_of_day":"HH:MM (SOLO si kind=recurring)","repeat_minutes":entero de minutos o null}
+ack_reminder: {}
+cancel_reminder: {"search_term":"texto para identificar el recordatorio recurrente a cancelar"}
+query: {"query_type":"pending_tasks|ideas|today|overdue|category|reminders","category":"DEBE ser null por DEFAULT. Solo poner yave|loslagos|personal|general SI la pregunta menciona EXPLICITAMENTE ese proyecto. Ejemplo: 'que tareas tengo' -> category null. 'que tareas tengo de yave' -> category yave."}
 complete: {"search_term":"texto para buscar la tarea"}
 kill: {"search_term":"texto para buscar la tarea"}
 postpone: {"search_term":"texto para buscar la tarea","new_due_date":"YYYY-MM-DD"}
@@ -398,7 +446,12 @@ INVITADOS EN agendar_evento (campo attendees):
 
 FECHA: {{CURRENT_DATE}} ({{DAY_NAME}}) | HORA: {{CURRENT_TIME}}
 
-Para reminders: calcula fecha/hora real. 'manana a las 8' = fecha de manana 08:00. 'en 2 horas' = suma desde hora actual."""
+RECORDATORIOS (intent reminder):
+- kind "once": un solo disparo. Calcula remind_at con fecha y hora reales ('manana a las 8' = manana 08:00; 'en 2 horas' = suma desde la hora actual). NO pongas days ni time_of_day.
+- kind "recurring": se repite en el tiempo. Pon days (lista con SOLO los dias que apliquen) y time_of_day (HH:MM, formato 24h). NO pongas remind_at. Equivalencias: "todos los dias" = los 7 dias; "de lunes a viernes"/"entre semana" = ["mon","tue","wed","thu","fri"]; "los lunes" = ["mon"]; "fines de semana" = ["sat","sun"].
+- repeat_minutes: SOLO si Christian pide que le INSISTAS hasta que confirme ("cada 5 minutos hasta que te diga OK", "no pares hasta que responda"). Pon ahi los minutos; si Christian no especifica cada cuanto, usa 5. Si no pide insistencia, repeat_minutes = null.
+- Ejemplo: "recuerdame poner a cargar la patineta a las 9am de lunes a viernes y cada 5 min hasta que diga OK" -> {"intent":"reminder","data":{"message":"poner a cargar la patineta","kind":"recurring","days":["mon","tue","wed","thu","fri"],"time_of_day":"09:00","repeat_minutes":5},"response":"Listo, te lo recuerdo lun-vie a las 9am y te insisto hasta tu OK."}
+- Ejemplo: "recuerdame en 2 horas llamar a Juan" -> {"intent":"reminder","data":{"message":"llamar a Juan","kind":"once","remind_at":"YYYY-MM-DD HH:MM ya calculado","repeat_minutes":null},"response":"Hecho, te aviso."}"""
 
 
 def build_system_prompt(query_text=None):
@@ -476,7 +529,7 @@ def build_system_prompt(query_text=None):
                 memories_block = memories_block + "- [" + date_label + "] " + role_label + ": " + content_short + "\n"
 
     body = get_config("system_prompt", DEFAULT_PROMPT_BODY)
-    return (body
+    prompt = (body
         .replace("{{CONTEXT_BLOCK}}", context_block)
         .replace("{{TASKS_BLOCK}}", tasks_block)
         .replace("{{IDEAS_BLOCK}}", ideas_block)
@@ -486,6 +539,19 @@ def build_system_prompt(query_text=None):
         .replace("{{DAY_NAME}}", day_name)
         .replace("{{CURRENT_TIME}}", current_time)
     )
+    # Bloque transitorio: si hay un recordatorio insistiendo, el agente debe
+    # saberlo para enrutar el "OK" de Christian a intent ack_reminder. Se anexa
+    # al final (no usa marcador) para que funcione tambien con prompt custom.
+    nagging = get_nagging_reminders()
+    if nagging:
+        block = ("\n\nRECORDATORIO ACTIVO ESPERANDO TU OK (se lo estas repitiendo a Christian "
+                 "cada pocos minutos hasta que confirme):\n")
+        for r in nagging:
+            block = block + "- " + r["message"] + "\n"
+        block = block + ("Si Christian responde algo que confirma que ya lo hizo o pide que pares "
+                          "(ok, listo, ya, hecho, dale, ya quedo, ya lo hice), usa intent ack_reminder.")
+        prompt = prompt + block
+    return prompt
 
 
 async def interpret_message(text):
@@ -544,11 +610,32 @@ def add_idea(data):
     return row[0]
 
 
+def _normalize_days(days):
+    if isinstance(days, str):
+        days = [d.strip() for d in days.split(",")]
+    return [d for d in (days or []) if d in _DOW_TOKENS]
+
+
+def _normalize_repeat(value):
+    try:
+        n = int(value) if value not in (None, "", False) else None
+    except (TypeError, ValueError):
+        return None
+    return n if (n and n > 0) else None
+
+
 def add_reminder(data):
     conn = get_db()
+    kind = "recurring" if data.get("kind") == "recurring" else "once"
+    days = _normalize_days(data.get("days"))
+    days_str = ",".join(days) if days else None
+    time_of_day = (data.get("time_of_day") or "").strip() or None
+    repeat_minutes = _normalize_repeat(data.get("repeat_minutes"))
+    remind_at = data.get("remind_at", "") if kind == "once" else ""
     conn.execute(
-        "INSERT INTO reminders (message,remind_at) VALUES (?,?)",
-        (data.get("message", ""), data.get("remind_at", ""))
+        "INSERT INTO reminders (message,remind_at,kind,days,time_of_day,repeat_minutes) "
+        "VALUES (?,?,?,?,?,?)",
+        (data.get("message", ""), remind_at, kind, days_str, time_of_day, repeat_minutes)
     )
     conn.commit()
     row = conn.execute("SELECT last_insert_rowid()").fetchone()
@@ -743,19 +830,89 @@ def get_today_summary():
     }
 
 
-def get_pending_reminders():
+def get_due_once_reminders():
     now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
     conn = get_db()
     rows = conn.execute(
-        "SELECT id,message,remind_at FROM reminders WHERE sent=0 AND remind_at<=?", (now,)
+        "SELECT id,message,repeat_minutes FROM reminders "
+        "WHERE kind='once' AND sent=0 AND remind_at!='' AND remind_at<=?", (now,)
     ).fetchall()
-    return [{"id": r[0], "message": r[1], "remind_at": r[2]} for r in rows]
+    return [{"id": r[0], "message": r[1], "repeat_minutes": r[2]} for r in rows]
+
+
+def get_idle_recurring_reminders():
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id,message,days,time_of_day,repeat_minutes,last_fired_at FROM reminders "
+        "WHERE kind='recurring' AND active=1 AND state='idle'"
+    ).fetchall()
+    return [{"id": r[0], "message": r[1], "days": r[2], "time_of_day": r[3],
+             "repeat_minutes": r[4], "last_fired_at": r[5]} for r in rows]
+
+
+def get_nagging_reminders():
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id,message,repeat_minutes,last_fired_at,nagging_since FROM reminders "
+        "WHERE state='nagging'"
+    ).fetchall()
+    return [{"id": r[0], "message": r[1], "repeat_minutes": r[2],
+             "last_fired_at": r[3], "nagging_since": r[4]} for r in rows]
 
 
 def mark_reminder_sent(rid):
     conn = get_db()
     conn.execute("UPDATE reminders SET sent=1 WHERE id=?", (rid,))
     conn.commit()
+
+
+def mark_reminder_fired(rid, nagging, mark_sent=False, start_nag=False):
+    conn = get_db()
+    now_iso = datetime.now(tz).isoformat()
+    state = "nagging" if nagging else "idle"
+    sets = ["state=?", "last_fired_at=?"]
+    params = [state, now_iso]
+    if mark_sent:
+        sets.append("sent=1")
+    if start_nag:
+        sets.append("nagging_since=?")  # marca el inicio de la insistencia
+        params.append(now_iso)
+    params.append(rid)
+    conn.execute("UPDATE reminders SET " + ", ".join(sets) + " WHERE id=?", tuple(params))
+    conn.commit()
+
+
+def stop_nagging_reminder(rid):
+    conn = get_db()
+    conn.execute("UPDATE reminders SET state='idle' WHERE id=?", (rid,))
+    conn.commit()
+
+
+def cancel_recurring_reminder(search_term):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id,message FROM reminders "
+        "WHERE kind='recurring' AND active=1 AND LOWER(message) LIKE ?",
+        ("%" + (search_term or "").lower() + "%",)
+    ).fetchall()
+    if len(rows) == 1:
+        conn.execute("UPDATE reminders SET active=0, state='idle' WHERE id=?", (rows[0][0],))
+        conn.commit()
+        return rows[0][1]
+    elif len(rows) > 1:
+        return "MULTIPLE:" + ", ".join(r[1] for r in rows)
+    return None
+
+
+def get_scheduled_reminders():
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id,message,kind,days,time_of_day,repeat_minutes,remind_at "
+        "FROM reminders WHERE (kind='recurring' AND active=1) OR (kind='once' AND sent=0) "
+        "ORDER BY kind DESC, time_of_day, remind_at"
+    ).fetchall()
+    return [{"id": r[0], "message": r[1], "kind": r[2], "days": r[3],
+             "time_of_day": r[4], "repeat_minutes": r[5], "remind_at": r[6]} for r in rows]
 
 
 def is_calendar_notification_sent(event_id, notif_type):
@@ -869,6 +1026,23 @@ def format_ideas(ideas):
     return "\n".join(lines)
 
 
+def format_reminders(rems):
+    if not rems:
+        return "⏰ No tienes recordatorios programados."
+    lines = ["⏰ *RECORDATORIOS*\n"]
+    for r in rems:
+        if r.get("kind") == "recurring":
+            when = (_describe_days(_normalize_days(r.get("days")))
+                    + " a las " + (r.get("time_of_day") or "?"))
+            line = "\U0001f501 " + r.get("message", "") + " — " + when
+        else:
+            line = "\U0001f550 " + r.get("message", "") + " — " + (r.get("remind_at") or "")
+        if r.get("repeat_minutes"):
+            line = line + " _(insiste c/" + str(r["repeat_minutes"]) + "min)_"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def format_summary(s):
     lines = [
         "\U0001f4ca *RESUMEN DEL DIA*\n",
@@ -931,6 +1105,8 @@ async def process_message(phone, text):
         return await send_whatsapp(phone, format_tasks(get_pending_tasks()))
     if lower in ["ideas", "mis ideas"]:
         return await send_whatsapp(phone, format_ideas(get_recent_ideas()))
+    if lower in ["recordatorios", "mis recordatorios"]:
+        return await send_whatsapp(phone, format_reminders(get_scheduled_reminders()))
     if lower == "ayuda":
         return await send_whatsapp(
             phone,
@@ -949,6 +1125,16 @@ async def process_message(phone, text):
             "- _Ten en cuenta que el lanzamiento es en abril_\n\n"
             "*Tambien puedes enviarme notas de voz!*"
         )
+
+    # Pre-check: si hay un recordatorio insistiendo y Christian responde un
+    # "OK" simple, lo apagamos al instante sin pasar por el modelo.
+    if lower.strip(" .!,;:¡¿") in ACK_WORDS:
+        nagging = get_nagging_reminders()
+        if nagging:
+            for r in nagging:
+                stop_nagging_reminder(r["id"])
+            return await send_whatsapp(
+                phone, "\U0001f44d Listo, dejo de recordartelo. Cualquier cosa me avisas.")
 
     result = await interpret_message(text)
     intent = result.get("intent", "chat")
@@ -975,7 +1161,17 @@ async def process_message(phone, text):
 
     elif intent == "reminder":
         rid = add_reminder(data)
-        msg = "\u23f0 Recordatorio #" + str(rid) + "\n_" + data.get("message", "") + "_\n\U0001f550 " + data.get("remind_at", "")
+        if data.get("kind") == "recurring":
+            when = (_describe_days(_normalize_days(data.get("days")))
+                    + " a las " + (data.get("time_of_day") or "?"))
+        else:
+            when = data.get("remind_at", "")
+        msg = ("\u23f0 Recordatorio #" + str(rid) + "\n_" + data.get("message", "")
+               + "_\n\U0001f550 " + when)
+        repeat = _normalize_repeat(data.get("repeat_minutes"))
+        if repeat:
+            msg = msg + ("\n\U0001f501 Te insisto cada " + str(repeat)
+                         + " min hasta que me digas *OK*")
         if response_text:
             msg = msg + "\n\n" + response_text
         await send_whatsapp(phone, msg)
@@ -994,6 +1190,8 @@ async def process_message(phone, text):
                 await send_whatsapp(phone, "\u26a0\ufe0f *VENCIDAS*\n" + format_tasks(tasks))
             else:
                 await send_whatsapp(phone, "\u2705 Nada vencido.")
+        elif qt == "reminders":
+            await send_whatsapp(phone, format_reminders(get_scheduled_reminders()))
         else:
             await send_whatsapp(phone, response_text)
 
@@ -1134,6 +1332,30 @@ async def process_message(phone, text):
                 msg = msg + "\n\n" + response_text
             await send_whatsapp(phone, msg)
 
+    elif intent == "ack_reminder":
+        nagging = get_nagging_reminders()
+        for r in nagging:
+            stop_nagging_reminder(r["id"])
+        if nagging:
+            msg = "\U0001f44d Listo, dejo de recordartelo."
+            if response_text:
+                msg = msg + "\n\n" + response_text
+            await send_whatsapp(phone, msg)
+        else:
+            await send_whatsapp(phone, response_text or "\U0001f44d")
+
+    elif intent == "cancel_reminder":
+        found = cancel_recurring_reminder(data.get("search_term", ""))
+        if found and found.startswith("MULTIPLE:"):
+            await send_whatsapp(phone, "\U0001f914 Varios coinciden:\n" + found[9:] + "\n\nSe mas especifico.")
+        elif found:
+            msg = "\U0001f6d1 Cancelado: *" + found + "*. Ya no te lo recuerdo."
+            if response_text:
+                msg = msg + "\n\n" + response_text
+            await send_whatsapp(phone, msg)
+        else:
+            await send_whatsapp(phone, "\U0001f50d No encontre un recordatorio recurrente con eso. Escribe *recordatorios* para ver la lista.")
+
     else:
         await send_whatsapp(phone, response_text)
 
@@ -1141,11 +1363,89 @@ async def process_message(phone, text):
 scheduler = AsyncIOScheduler(timezone=TIMEZONE)
 
 
+def _reminder_msg(message, repeating, again=False):
+    head = "\u23f0 *RECORDATORIO*"
+    if again:
+        head = head + " (otra vez)"
+    body = head + "\n\n" + message
+    if repeating:
+        body = body + "\n\n_Respondeme *OK* cuando lo hagas y dejo de recordartelo._"
+    return body
+
+
+def _recurring_due(rem, now):
+    days = (rem.get("days") or "").split(",")
+    if _DOW_TOKENS[now.weekday()] not in days:
+        return False
+    try:
+        hh, mm = (rem.get("time_of_day") or "").split(":")
+        scheduled = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+    except (ValueError, TypeError):
+        return False
+    last = rem.get("last_fired_at")
+    if last:
+        try:
+            if datetime.fromisoformat(last).date() == now.date():
+                return False  # ya disparado hoy
+        except ValueError:
+            pass
+    delta = (now - scheduled).total_seconds()
+    return 0 <= delta < RECURRING_CATCHUP_SECONDS
+
+
 async def check_reminders():
-    for r in get_pending_reminders():
-        if MY_PHONE_NUMBER:
-            await send_whatsapp(MY_PHONE_NUMBER, "\u23f0 *RECORDATORIO*\n\n" + r["message"])
+    if not MY_PHONE_NUMBER:
+        return
+    now = datetime.now(tz)
+    end_hour = get_timing("nudge_window_end_hour")
+
+    # 1. Recordatorios puntuales (once) que vencen ahora
+    for r in get_due_once_reminders():
+        repeating = bool(r.get("repeat_minutes"))
+        await send_whatsapp(MY_PHONE_NUMBER, _reminder_msg(r["message"], repeating))
+        if repeating:
+            mark_reminder_fired(r["id"], nagging=True, mark_sent=True, start_nag=True)
+        else:
             mark_reminder_sent(r["id"])
+
+    # 2. Recordatorios recurrentes que toca disparar
+    for r in get_idle_recurring_reminders():
+        if _recurring_due(r, now):
+            repeating = bool(r.get("repeat_minutes"))
+            await send_whatsapp(MY_PHONE_NUMBER, _reminder_msg(r["message"], repeating))
+            mark_reminder_fired(r["id"], nagging=repeating, mark_sent=False, start_nag=repeating)
+
+    # 3. Recordatorios insistiendo: repetir hasta el OK de Christian.
+    #    Se rinde tras nag_max_minutes desde el primer aviso (o pasada la noche).
+    max_nag_sec = get_timing("nag_max_minutes") * 60
+    for r in get_nagging_reminders():
+        give_up = now.hour >= end_hour
+        started = r.get("nagging_since")
+        if started:
+            try:
+                if (now - datetime.fromisoformat(started)).total_seconds() >= max_nag_sec:
+                    give_up = True
+            except ValueError:
+                pass
+        if give_up:
+            stop_nagging_reminder(r["id"])
+            await send_whatsapp(
+                MY_PHONE_NUMBER,
+                "🔕 Listo, dejo de insistir con *" + r["message"]
+                + "*. Si te quedo pendiente, me lo recuerdas y lo retomamos.")
+            continue
+        repeat_min = r.get("repeat_minutes") or 5
+        last = r.get("last_fired_at")
+        due_again = True
+        if last:
+            try:
+                elapsed = (now - datetime.fromisoformat(last)).total_seconds()
+                due_again = elapsed >= repeat_min * 60
+            except ValueError:
+                due_again = True
+        if due_again:
+            await send_whatsapp(MY_PHONE_NUMBER, _reminder_msg(r["message"], True, again=True))
+            mark_reminder_fired(r["id"], nagging=True, mark_sent=False)
 
 
 async def morning_summary():
@@ -1796,6 +2096,7 @@ TIMING_LABELS = [
     ("nudge_cap_per_task", "Max nudges por tarea", "Despues de N, forzar decision"),
     ("followup_no_response_hours", "Followup sin respuesta (horas)", "Si no contestas, marca no_response"),
     ("message_buffer_seconds", "Buffer de mensajes (segundos)", "Espera N seg antes de procesar; si llegan mas mensajes, los junta"),
+    ("nag_max_minutes", "Tope de insistencia (minutos)", "Cuanto insiste un recordatorio repetitivo antes de rendirse"),
 ]
 
 
