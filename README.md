@@ -130,7 +130,8 @@ whatsapp-assistant/
 Si configuras `GITHUB_TOKEN` y `VAULT_REPO`, el bot escribe cada tarea, idea,
 recordatorio y nota de contexto como un archivo markdown en un repo de GitHub
 que hace de vault de Obsidian. Al completar o descartar una tarea, actualiza
-el `estado:` en su nota.
+el `estado:` en su nota. Tambien puedes pedirle que busque en tus notas:
+*"busca en mis notas qué dije sobre Los Lagos"*, *"que tengo escrito sobre Cartagena"*.
 
 Para conectarlo:
 

@@ -253,3 +253,40 @@ async def mark_task_completed(title):
 
 async def mark_task_killed(title):
     await _set_task_estado(title, "descartada", "descartado")
+
+
+async def search_notes(query: str, limit: int = 5):
+    """Busca el query en los .md del vault via GitHub code search.
+
+    Retorna lista de dicts con 'name', 'path', 'snippet'. Lista vacia si no
+    hay vault configurado, si la query esta vacia, o si la busqueda falla.
+    """
+    if not is_configured() or not query.strip():
+        return []
+    q = query.strip() + " repo:" + VAULT_REPO + " extension:md"
+    url = "https://api.github.com/search/code"
+    headers = dict(_headers())
+    headers["Accept"] = "application/vnd.github.text-match+json"
+    async with httpx.AsyncClient() as http:
+        try:
+            resp = await http.get(
+                url, headers=headers, params={"q": q, "per_page": limit}, timeout=15
+            )
+            if resp.status_code != 200:
+                logger.warning("obsidian search '%s' -> HTTP %s", query, resp.status_code)
+                return []
+            results = []
+            for item in resp.json().get("items", []):
+                snippet = ""
+                matches = item.get("text_matches") or []
+                if matches:
+                    snippet = (matches[0].get("fragment") or "").strip()
+                results.append({
+                    "name": item.get("name", ""),
+                    "path": item.get("path", ""),
+                    "snippet": snippet[:240],
+                })
+            return results
+        except Exception as e:
+            logger.error("obsidian search error: %s", e)
+            return []

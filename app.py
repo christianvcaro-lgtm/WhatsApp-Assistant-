@@ -331,6 +331,7 @@ QUE PUEDES HACER:
 8. Marcar como completada (complete), descartar sin hacer (kill) o posponer (postpone) tareas existentes
 9. Insistir solo (proactivamente) con tareas vencidas: el sistema te muestra cuantos recordatorios lleva cada una y cuantas veces se pospuso
 10. Consultar la agenda de un dia (listar_eventos), editar un evento ya agendado (editar_evento) y cancelarlo (cancelar_evento)
+11. Buscar en las notas que Christian tiene en su vault de Obsidian (vault_search)
 
 COMPORTAMIENTO PROACTIVO (importante para interpretar el historial):
 - Tu envias mensajes solo (sin que Christian escriba) en 3 casos: avisos pre-evento, follow-up post-evento ("¿se dio? ¿que quedo pendiente?") y recordatorios de tareas vencidas.
@@ -359,6 +360,7 @@ INTENTS POSIBLES:
 - cancelar_evento: cuando quiere CANCELAR o BORRAR un evento del calendario (detecta: "cancela la reunion con Juan", "borra el evento", "elimina la cita"). Distinto de kill: kill es para tareas, cancelar_evento para eventos del calendario.
 - event_followup_response: SOLO cuando en la conversacion reciente TU (asistente) hiciste una pregunta del tipo "Tu reunion X termino hace ~30 min. ¿Se dio? ¿Que quedo pendiente?" y el usuario esta respondiendo a esa pregunta especifica. Detecta outcome (si la reunion ocurrio o no) y extrae los pendientes que menciona.
 - redactar: cuando quiere AYUDA PARA ESCRIBIR un mensaje a alguien (detecta: "ayudame a escribirle", "como le digo a", "que le respondo a", "redactame", "escribirle a", "mensaje para"). Genera 3 variaciones en SU voz (amigable colombiano informal, directo, calido, nunca corporativo).
+- vault_search: cuando pide BUSCAR ALGO en sus notas/vault/obsidian (detecta: "busca en mis notas", "que tengo escrito sobre", "que dije sobre X en obsidian", "revisa mi vault", "mis notas de X"). Extrae el termino a buscar. Distinto de query: query es sobre tareas/ideas guardadas en la DB; vault_search es sobre el texto de las notas markdown del vault.
 - chat: conversacion normal, consejo, ayuda para pensar
 
 DATA POR INTENT:
@@ -376,6 +378,7 @@ editar_evento: {"search_term":"texto del titulo del evento a buscar","new_date":
 cancelar_evento: {"search_term":"texto del titulo del evento a buscar"}
 event_followup_response: {"outcome":"happened|didnt_happen|unknown","pending_tasks":["titulo corto 1","titulo corto 2"]}
 redactar: {"destinatario":"para quien es el mensaje","contexto":"que quiere comunicar","variaciones":["v1 mas corta/directa","v2 mas calida","v3 alternativa"]}
+vault_search: {"query":"texto a buscar en las notas"}
 chat: {}
 
 REGLAS DE PRIORIDAD:
@@ -919,6 +922,19 @@ def format_ideas(ideas):
     return "\n".join(lines)
 
 
+def format_vault_results(query, results):
+    if not results:
+        return "\U0001f4d3 No encontre nada en tu vault con: " + query
+    lines = ["\U0001f4d3 *Tu vault - " + query + "*"]
+    for r in results:
+        path = r.get("path", "").rsplit(".", 1)[0]
+        lines.append("\n• " + path)
+        snippet = r.get("snippet", "")
+        if snippet:
+            lines.append("  _" + snippet.replace("\n", " ") + "_")
+    return "\n".join(lines)
+
+
 def format_summary(s):
     lines = [
         "\U0001f4ca *RESUMEN DEL DIA*\n",
@@ -1328,6 +1344,17 @@ async def process_message(phone, text):
                     await send_whatsapp(phone, msg)
                 else:
                     await send_whatsapp(phone, "Hubo un error cancelando el evento. Intenta de nuevo.")
+
+    elif intent == "vault_search":
+        if not obsidian.is_configured():
+            await send_whatsapp(phone, "Tu vault de Obsidian no esta conectado todavia.")
+        else:
+            query = (data.get("query") or "").strip()
+            if not query:
+                await send_whatsapp(phone, "¿Qué busco en tu vault?")
+            else:
+                results = await obsidian.search_notes(query, limit=5)
+                await send_whatsapp(phone, format_vault_results(query, results))
 
     else:
         await send_whatsapp(phone, response_text)

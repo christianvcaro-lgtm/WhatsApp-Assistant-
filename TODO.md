@@ -18,20 +18,17 @@ Pendiente:
 
 ## Obsidian
 
-Hecho: integracion de ESCRITURA restaurada en el modulo `obsidian.py`. El bot
-escribe cada tarea/idea/recordatorio/contexto como nota markdown en un repo de
-GitHub que hace de vault, y actualiza el `estado:` al completar o descartar
-tareas. Se activa con las env vars `GITHUB_TOKEN` y `VAULT_REPO`.
+Integracion bidireccional con un vault de Obsidian alojado en GitHub, en
+`obsidian.py`. Se activa con las env vars `GITHUB_TOKEN` y `VAULT_REPO`.
 
-Pendiente — lado de LECTURA:
+Escritura: el bot guarda cada tarea, idea, recordatorio y nota de contexto
+como nota markdown con frontmatter, y actualiza el `estado:` al completar o
+descartar una tarea.
 
-- El `sync_vault_to_db` viejo (importar notas del vault a la DB en cada
-  arranque) NO se restauro: con la DB persistente de Turso su dedup por
-  titulo+fecha genera duplicados (la fecha local del frontmatter no coincide
-  con el `created_at` en UTC). Necesita rediseno.
-- Opcion mas liviana propuesta: en vez de auto-importar todo, un intent para
-  consultar el vault bajo demanda ("busca en mis notas X"), sin volcar nada a
-  las tablas. Evita duplicados y no carga el vault entero en el prompt.
+Lectura: intent `vault_search` para buscar bajo demanda en las notas del
+vault ("busca en mis notas X", "que tengo escrito sobre Y") usando GitHub
+code search. No se auto-importa nada a la DB — eso evita duplicados sobre
+la DB persistente de Turso y no carga el vault entero en cada mensaje.
 
 ## Autonomia — fase 2 (ejecutar con confirmacion)
 
