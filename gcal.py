@@ -13,6 +13,7 @@ Opcionales (con defaults):
 """
 import os
 import logging
+import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -200,6 +201,13 @@ def create_event(
         "summary": title,
         "start": {"dateTime": start_iso, "timeZone": GOOGLE_TIMEZONE},
         "end": {"dateTime": end_iso, "timeZone": GOOGLE_TIMEZONE},
+        # Siempre adjuntar un Google Meet al crear el evento.
+        "conferenceData": {
+            "createRequest": {
+                "requestId": uuid.uuid4().hex,
+                "conferenceSolutionKey": {"type": "hangoutsMeet"},
+            }
+        },
     }
     if description:
         body["description"] = description
@@ -216,6 +224,7 @@ def create_event(
         request = service.events().insert(
             calendarId=GOOGLE_CALENDAR_ID,
             body=body,
+            conferenceDataVersion=1,
             sendUpdates="all" if clean_attendees else "none",
         )
         return request.execute()
@@ -225,6 +234,17 @@ def create_event(
     except Exception as e:
         logger.error("gcal create unexpected error: %s", e)
         return None
+
+
+def _meet_link(event: dict) -> str:
+    """Devuelve el enlace de Google Meet del evento, o '' si no tiene."""
+    link = event.get("hangoutLink", "")
+    if link:
+        return link
+    for ep in event.get("conferenceData", {}).get("entryPoints", []) or []:
+        if ep.get("entryPointType") == "video" and ep.get("uri"):
+            return ep["uri"]
+    return ""
 
 
 def format_event_for_reminder(event: dict, notification_type: str) -> str:
@@ -256,6 +276,9 @@ def format_event_for_reminder(event: dict, notification_type: str) -> str:
 
     if location:
         msg = msg + "\n\U0001f4cd " + location
+    meet_link = _meet_link(event)
+    if meet_link:
+        msg = msg + "\n\U0001f4f9 " + meet_link
     return msg
 
 
@@ -325,6 +348,10 @@ def format_event_for_creation(event: dict) -> str:
     guest_emails = [a.get("email", "") for a in attendees if a.get("email")]
     if guest_emails:
         msg = msg + "\n\U0001f465 Invitados: " + ", ".join(guest_emails)
+
+    meet_link = _meet_link(event)
+    if meet_link:
+        msg = msg + "\n\U0001f4f9 Meet: " + meet_link
 
     if link:
         msg = msg + "\n\U0001f517 " + link
