@@ -7,3 +7,4 @@ libsql-experimental
 google-auth==2.32.0
 google-auth-oauthlib==1.2.1
 google-api-python-client==2.151.0
+playwright==1.49.0

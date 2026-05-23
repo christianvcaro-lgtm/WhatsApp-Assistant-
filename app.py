@@ -20,6 +20,9 @@ from openai import OpenAI
 
 import gcal
 import gmail
+import cinecolombia
+import dev_zone
+import dev_assistant
 
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")
 WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID", "653078644555574")
@@ -114,6 +117,13 @@ def migrate_schema():
     for col_name, col_def in new_task_columns:
         if not _column_exists(conn, "tasks", col_name):
             conn.execute("ALTER TABLE tasks ADD COLUMN " + col_name + " " + col_def)
+    new_reminder_columns = [
+        ("recurrence", "TEXT"),
+        ("cancelled", "INTEGER DEFAULT 0"),
+    ]
+    for col_name, col_def in new_reminder_columns:
+        if not _column_exists(conn, "reminders", col_name):
+            conn.execute("ALTER TABLE reminders ADD COLUMN " + col_name + " " + col_def)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS event_followups ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -136,6 +146,13 @@ def migrate_schema():
         "reason TEXT,"
         "notified INTEGER DEFAULT 0,"
         "created_at TEXT DEFAULT (datetime('now')))"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS cinema_sessions ("
+        "phone TEXT PRIMARY KEY,"
+        "films_json TEXT NOT NULL,"
+        "business_date TEXT NOT NULL,"
+        "updated_at TEXT DEFAULT (datetime('now')))"
     )
     conn.commit()
 
@@ -345,8 +362,9 @@ Estructura:
 INTENTS POSIBLES:
 - task: cuando quiere agregar algo que HACER (detecta: "tengo que", "necesito", "hay que", "pendiente", "hacer", "tarea")
 - idea: cuando tiene una IDEA (detecta: "idea", "se me ocurrio", "que tal si", "podriamos")
-- reminder: cuando quiere un RECORDATORIO (detecta: "recuerdame", "no se me olvide", "avisame", "a las X")
-- query: cuando PREGUNTA por sus cosas (detecta: "que tengo", "que tareas tengo", "que pendientes tengo", "pendientes", "resumen", "como voy", "mis tareas", "muestrame mis", "muestra mis", "lista", "cuales son", "que hay")
+- reminder: cuando quiere un RECORDATORIO (detecta: "recuerdame", "no se me olvide", "avisame", "a las X"). Puede ser puntual o RECURRENTE: "todos los dias", "todos los lunes", "de lunes a viernes", "los fines de semana", "cada mes el 5", "cada año en X fecha", "cada lunes y miercoles".
+- cancel_reminder: cuando quiere CANCELAR/ELIMINAR un recordatorio recurrente activo (detecta: "cancela el recordatorio de X", "quita el aviso de X", "ya no me recuerdes X", "elimina el recordatorio X")
+- query: cuando PREGUNTA por sus cosas (detecta: "que tengo", "que tareas tengo", "que pendientes tengo", "pendientes", "resumen", "como voy", "mis tareas", "muestrame mis", "muestra mis", "lista", "cuales son", "que hay", "mis recordatorios", "que recordatorios tengo")
 - complete: cuando COMPLETO algo (detecta: "listo", "hecho", "ya hice", "termine")
 - kill: cuando quiere DESCARTAR una tarea sin haberla hecho (detecta: "olvidalo", "ya no", "matala", "borra eso", "descarta", "cancelala", "quitala"). Marca la tarea como killed sin completarla.
 - postpone: cuando POSTERGA una tarea existente para otro dia (detecta: "lo hago mañana", "el viernes lo veo", "mas tarde", "lo dejo para X dia"). Identifica de cual tarea pendiente esta hablando y calcula la nueva fecha. NO uses postpone para tareas nuevas - solo para mover tareas ya en la lista.
@@ -359,8 +377,9 @@ INTENTS POSIBLES:
 DATA POR INTENT:
 task: {"title":"corto","description":"detalle o null","priority":"alta|media|baja","category":"yave|loslagos|personal|general","due_date":"YYYY-MM-DD o null"}
 idea: {"content":"la idea completa","category":"yave|loslagos|personal|general","tags":["tag1"]}
-reminder: {"message":"que recordar","remind_at":"YYYY-MM-DD HH:MM"}
-query: {"query_type":"pending_tasks|ideas|today|overdue|category","category":"DEBE ser null por DEFAULT. Solo poner yave|loslagos|personal|general SI la pregunta menciona EXPLICITAMENTE ese proyecto. Ejemplo: 'que tareas tengo' -> category null. 'que tareas tengo de yave' -> category yave."}
+reminder: {"message":"que recordar","remind_at":"YYYY-MM-DD HH:MM","recurrence":"null|daily|weekdays|weekends|weekly:0,1,2|monthly:5|yearly:MM-DD"}
+cancel_reminder: {"search_term":"texto para identificar el recordatorio (ej: 'patineta', 'reunion lunes')"}
+query: {"query_type":"pending_tasks|ideas|today|overdue|category|reminders","category":"DEBE ser null por DEFAULT. Solo poner yave|loslagos|personal|general SI la pregunta menciona EXPLICITAMENTE ese proyecto. Ejemplo: 'que tareas tengo' -> category null. 'que tareas tengo de yave' -> category yave."}
 complete: {"search_term":"texto para buscar la tarea"}
 kill: {"search_term":"texto para buscar la tarea"}
 postpone: {"search_term":"texto para buscar la tarea","new_due_date":"YYYY-MM-DD"}
@@ -409,7 +428,18 @@ INVITADOS EN agendar_evento (campo attendees):
 
 FECHA: {{CURRENT_DATE}} ({{DAY_NAME}}) | HORA: {{CURRENT_TIME}}
 
-Para reminders: calcula fecha/hora real. 'manana a las 8' = fecha de manana 08:00. 'en 2 horas' = suma desde hora actual."""
+Para reminders: calcula fecha/hora real. 'manana a las 8' = fecha de manana 08:00. 'en 2 horas' = suma desde hora actual.
+
+REGLAS DE RECURRENCIA (campo recurrence en reminder):
+- null si es UN solo recordatorio puntual ("recuerdame manana a las 8").
+- "daily" si es TODOS los dias ("recuerdame cada dia a las 7am", "diariamente").
+- "weekdays" para LUNES A VIERNES ("de lunes a viernes", "entresemana", "los dias de semana").
+- "weekends" para SABADO Y DOMINGO ("los fines de semana").
+- "weekly:0,1,2,3,4,5,6" con dias especificos (0=lunes, 1=martes, 2=miercoles, 3=jueves, 4=viernes, 5=sabado, 6=domingo). Ej: "todos los lunes y miercoles" -> "weekly:0,2". "cada martes" -> "weekly:1".
+- "monthly:DD" para una vez al mes en el dia DD. Ej: "cada 5 de mes" -> "monthly:5".
+- "yearly:MM-DD" para una vez al ano. Ej: "cada 15 de noviembre" -> "yearly:11-15".
+
+CALCULO DE remind_at CON RECURRENCIA: remind_at SIEMPRE es la PROXIMA ocurrencia real (fecha y hora futura). Si hoy es lunes y dice "cada martes a las 8am", remind_at = manana 08:00. Si es viernes y dice "lunes a viernes a las 8:45am", remind_at = lunes proximo 08:45 (no hoy)."""
 
 
 DEFAULT_EMAIL_CRITERIA = """Eres el filtro de correo de Christian. Tu trabajo: decidir si un correo merece interrumpirlo con una notificacion de WhatsApp, o no.
@@ -578,13 +608,117 @@ def add_idea(data):
 
 def add_reminder(data):
     conn = get_db()
+    recurrence = data.get("recurrence")
+    if recurrence in ("", "null", "none"):
+        recurrence = None
     conn.execute(
-        "INSERT INTO reminders (message,remind_at) VALUES (?,?)",
-        (data.get("message", ""), data.get("remind_at", ""))
+        "INSERT INTO reminders (message,remind_at,recurrence) VALUES (?,?,?)",
+        (data.get("message", ""), data.get("remind_at", ""), recurrence)
     )
     conn.commit()
     row = conn.execute("SELECT last_insert_rowid()").fetchone()
     return row[0]
+
+
+WEEKDAY_NAMES_ES = ["lun", "mar", "mie", "jue", "vie", "sab", "dom"]
+
+
+def parse_recurrence(recurrence):
+    if not recurrence:
+        return None
+    rec = recurrence.strip().lower()
+    if rec in ("daily", "diario", "todos los dias"):
+        return ("daily", None)
+    if rec in ("weekdays", "lun-vie", "entresemana"):
+        return ("weekly", [0, 1, 2, 3, 4])
+    if rec in ("weekends", "finde", "fin de semana"):
+        return ("weekly", [5, 6])
+    if rec.startswith("weekly:"):
+        try:
+            days = sorted({int(d) for d in rec.split(":", 1)[1].split(",")
+                           if d.strip().isdigit() and 0 <= int(d) <= 6})
+            return ("weekly", days) if days else None
+        except Exception:
+            return None
+    if rec.startswith("monthly:"):
+        try:
+            day = int(rec.split(":", 1)[1])
+            if 1 <= day <= 31:
+                return ("monthly", day)
+        except Exception:
+            return None
+    if rec.startswith("yearly:"):
+        try:
+            m, d = rec.split(":", 1)[1].split("-")
+            return ("yearly", (int(m), int(d)))
+        except Exception:
+            return None
+    return None
+
+
+def compute_next_remind_at(current_remind_at, recurrence):
+    parsed = parse_recurrence(recurrence)
+    if parsed is None:
+        return None
+    try:
+        base = datetime.strptime(current_remind_at, "%Y-%m-%d %H:%M")
+    except Exception:
+        return None
+    now_local = datetime.now(tz).replace(tzinfo=None)
+    candidate = base
+    kind, payload = parsed
+    safety = 0
+    while safety < 800:
+        safety += 1
+        if kind == "daily":
+            candidate = candidate + timedelta(days=1)
+        elif kind == "weekly":
+            candidate = candidate + timedelta(days=1)
+            while candidate.weekday() not in payload:
+                candidate = candidate + timedelta(days=1)
+        elif kind == "monthly":
+            month = candidate.month + 1
+            year = candidate.year
+            if month > 12:
+                month = 1
+                year += 1
+            import calendar
+            last_day = calendar.monthrange(year, month)[1]
+            day = min(payload, last_day)
+            candidate = candidate.replace(year=year, month=month, day=day)
+        elif kind == "yearly":
+            m, d = payload
+            year = candidate.year + 1
+            try:
+                candidate = candidate.replace(year=year, month=m, day=d)
+            except ValueError:
+                candidate = candidate.replace(year=year, month=m, day=28)
+        else:
+            return None
+        if candidate > now_local:
+            return candidate.strftime("%Y-%m-%d %H:%M")
+    return None
+
+
+def format_recurrence_es(recurrence):
+    parsed = parse_recurrence(recurrence)
+    if parsed is None:
+        return ""
+    kind, payload = parsed
+    if kind == "daily":
+        return "todos los dias"
+    if kind == "weekly":
+        if payload == [0, 1, 2, 3, 4]:
+            return "lun a vie"
+        if payload == [5, 6]:
+            return "fin de semana"
+        return ", ".join(WEEKDAY_NAMES_ES[d] for d in payload)
+    if kind == "monthly":
+        return "dia " + str(payload) + " de cada mes"
+    if kind == "yearly":
+        m, d = payload
+        return "cada año el " + str(d).zfill(2) + "/" + str(m).zfill(2)
+    return ""
 
 
 def complete_task(search_term):
@@ -779,15 +913,54 @@ def get_pending_reminders():
     now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
     conn = get_db()
     rows = conn.execute(
-        "SELECT id,message,remind_at FROM reminders WHERE sent=0 AND remind_at<=?", (now,)
+        "SELECT id,message,remind_at,recurrence FROM reminders "
+        "WHERE sent=0 AND cancelled=0 AND remind_at<=?",
+        (now,)
     ).fetchall()
-    return [{"id": r[0], "message": r[1], "remind_at": r[2]} for r in rows]
+    return [
+        {"id": r[0], "message": r[1], "remind_at": r[2], "recurrence": r[3]}
+        for r in rows
+    ]
 
 
-def mark_reminder_sent(rid):
+def mark_reminder_sent(rid, recurrence=None, current_remind_at=None):
     conn = get_db()
+    if recurrence:
+        next_at = compute_next_remind_at(current_remind_at, recurrence)
+        if next_at:
+            conn.execute("UPDATE reminders SET remind_at=? WHERE id=?", (next_at, rid))
+            conn.commit()
+            return
     conn.execute("UPDATE reminders SET sent=1 WHERE id=?", (rid,))
     conn.commit()
+
+
+def get_active_reminders():
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id,message,remind_at,recurrence FROM reminders "
+        "WHERE sent=0 AND cancelled=0 ORDER BY remind_at"
+    ).fetchall()
+    return [
+        {"id": r[0], "message": r[1], "remind_at": r[2], "recurrence": r[3]}
+        for r in rows
+    ]
+
+
+def cancel_reminder(search_term):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id,message FROM reminders WHERE sent=0 AND cancelled=0 "
+        "AND LOWER(message) LIKE ?",
+        ("%" + search_term.lower() + "%",)
+    ).fetchall()
+    if len(rows) == 1:
+        conn.execute("UPDATE reminders SET cancelled=1 WHERE id=?", (rows[0][0],))
+        conn.commit()
+        return rows[0][1]
+    if len(rows) > 1:
+        return "MULTIPLE:" + ", ".join(r[1] for r in rows)
+    return None
 
 
 def is_calendar_notification_sent(event_id, notif_type):
@@ -901,6 +1074,17 @@ def format_ideas(ideas):
     return "\n".join(lines)
 
 
+def format_reminders(reminders):
+    if not reminders:
+        return "⏰ No tienes recordatorios activos."
+    lines = ["⏰ *RECORDATORIOS ACTIVOS*\n"]
+    for r in reminders:
+        cadencia = format_recurrence_es(r.get("recurrence"))
+        suffix = " \U0001f501 " + cadencia if cadencia else ""
+        lines.append("#" + str(r["id"]) + " \U0001f550 " + r["remind_at"] + suffix + "\n   " + r["message"])
+    return "\n".join(lines)
+
+
 def format_summary(s):
     lines = [
         "\U0001f4ca *RESUMEN DEL DIA*\n",
@@ -954,8 +1138,187 @@ async def transcribe_audio(media_id):
     return transcript.text
 
 
+DEV_PENDING_KEY = "dev_pending_change"
+
+
+def _get_dev_pending() -> Optional[dict]:
+    raw = get_config(DEV_PENDING_KEY, "")
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+def _set_dev_pending(proposal: dict) -> None:
+    set_config(DEV_PENDING_KEY, json.dumps(proposal))
+
+
+def _clear_dev_pending() -> None:
+    delete_config(DEV_PENDING_KEY)
+
+
+async def handle_dev_command(phone: str, text: str):
+    if MY_PHONE_NUMBER and phone != MY_PHONE_NUMBER:
+        return await send_whatsapp(phone, "🔒 /dev solo esta disponible para el dueño del bot.")
+
+    sub, body = dev_assistant.parse_dev_command(text)
+
+    if sub == "ayuda":
+        return await send_whatsapp(phone, dev_assistant.HELP_TEXT)
+
+    if sub == "ver":
+        return await send_whatsapp(phone, dev_assistant.format_current_dev_zone())
+
+    if sub == "pending":
+        p = _get_dev_pending()
+        if not p:
+            return await send_whatsapp(phone, "📭 No hay propuesta pendiente.")
+        if dev_assistant.is_proposal_expired(p):
+            _clear_dev_pending()
+            return await send_whatsapp(phone, "⏰ La propuesta expiro. Vuelve a pedirla.")
+        return await send_whatsapp(phone, dev_assistant.format_proposal_for_whatsapp(p))
+
+    if sub == "no":
+        if _get_dev_pending():
+            _clear_dev_pending()
+            return await send_whatsapp(phone, "🗑 Propuesta descartada.")
+        return await send_whatsapp(phone, "📭 No habia propuesta pendiente.")
+
+    if sub == "ok":
+        p = _get_dev_pending()
+        if not p:
+            return await send_whatsapp(phone, "📭 No hay propuesta pendiente para aplicar.")
+        if dev_assistant.is_proposal_expired(p):
+            _clear_dev_pending()
+            return await send_whatsapp(phone, "⏰ La propuesta expiro. Vuelve a pedirla.")
+        await send_whatsapp(phone, "⏳ Aplicando cambio y haciendo commit...")
+        ok, msg = await dev_assistant.apply_change(p)
+        if ok:
+            _clear_dev_pending()
+        return await send_whatsapp(phone, msg)
+
+    # sub == "propose"
+    if not body:
+        return await send_whatsapp(phone, dev_assistant.HELP_TEXT)
+    await send_whatsapp(phone, "🧠 Pensando como modificar dev_zone.py...")
+    try:
+        proposal = dev_assistant.propose_change(openai_client, body)
+    except Exception as e:
+        logger.error("dev_assistant.propose_change fallo: %s", e)
+        return await send_whatsapp(phone, "❌ Error generando la propuesta: " + str(e)[:200])
+    if not proposal.get("new_content", "").strip():
+        return await send_whatsapp(phone, "❌ El LLM no devolvio contenido nuevo. Reformula la peticion.")
+    if proposal["new_content"] == proposal["old_content"]:
+        return await send_whatsapp(phone, "🤷 El LLM dice que no hay cambios que aplicar. Reformula.")
+    _set_dev_pending(proposal)
+    return await send_whatsapp(phone, dev_assistant.format_proposal_for_whatsapp(proposal))
+
+
+CINEMA_SESSION_TTL_MIN = 15
+
+
+def get_cinema_session(phone: str) -> Optional[dict]:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT films_json, business_date, updated_at FROM cinema_sessions WHERE phone=?",
+        (phone,)
+    ).fetchone()
+    if not row:
+        return None
+    try:
+        updated = datetime.fromisoformat(row[2])
+    except Exception:
+        updated = datetime.now(tz) - timedelta(hours=1)
+    if (datetime.now(tz).replace(tzinfo=None) - updated.replace(tzinfo=None)).total_seconds() > CINEMA_SESSION_TTL_MIN * 60:
+        return None
+    try:
+        films = json.loads(row[0])
+    except Exception:
+        return None
+    return {"films": films, "business_date": row[1]}
+
+
+def save_cinema_session(phone: str, films: list, business_date: str) -> None:
+    conn = get_db()
+    payload = json.dumps(films)
+    now_iso = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+    existing = conn.execute("SELECT phone FROM cinema_sessions WHERE phone=?", (phone,)).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE cinema_sessions SET films_json=?, business_date=?, updated_at=? WHERE phone=?",
+            (payload, business_date, now_iso, phone)
+        )
+    else:
+        conn.execute(
+            "INSERT INTO cinema_sessions (phone, films_json, business_date, updated_at) VALUES (?, ?, ?, ?)",
+            (phone, payload, business_date, now_iso)
+        )
+    conn.commit()
+
+
+def clear_cinema_session(phone: str) -> None:
+    conn = get_db()
+    conn.execute("DELETE FROM cinema_sessions WHERE phone=?", (phone,))
+    conn.commit()
+
+
+def format_cartelera(films: list, business_date: str) -> str:
+    if not films:
+        return "🎬 No hay funciones para hoy en Cartagena. Intenta manana."
+    try:
+        d = datetime.strptime(business_date, "%Y-%m-%d").date()
+        today = datetime.now(tz).date()
+        if d == today:
+            day_label = "HOY"
+        elif d == today + timedelta(days=1):
+            day_label = "MANANA"
+        else:
+            day_label = d.strftime("%a %d %b").upper()
+    except Exception:
+        day_label = business_date
+    lines = ["🎬 *EN CARTELERA " + day_label + "* (Cartagena)\n"]
+    for i, f in enumerate(films, 1):
+        n_shows = len(f.get("showtimes", []))
+        lines.append(str(i) + ". *" + f.get("title", "") + "* (" + str(n_shows) + " funciones)")
+    lines.append("\nResponde con el numero de la peli (ej: *1*) para ver horarios.")
+    return "\n".join(lines)
+
+
+def format_film_showtimes(film: dict) -> str:
+    lines = ["🎬 *" + film.get("title", "") + "*\n"]
+    by_site = {}
+    for s in film.get("showtimes", []):
+        site_id = s.get("siteId", "")
+        by_site.setdefault(site_id, []).append(s)
+    for site_id, shows in by_site.items():
+        lines.append("🏛 *" + cinecolombia.site_name(site_id) + "*")
+        for s in shows:
+            attrs = cinecolombia.format_attrs(s)
+            attrs_str = " (" + attrs + ")" if attrs else ""
+            link = cinecolombia.build_checkout_url(s.get("id", ""))
+            lines.append("  • " + cinecolombia.format_time(s) + attrs_str + " → " + link)
+        lines.append("")
+    lines.append("Tap el horario que quieras → elegis asientos y pagas en el sitio.")
+    return "\n".join(lines)
+
+
 async def process_message(phone, text):
     lower = text.strip().lower()
+
+    if dev_assistant.is_dev_command(text):
+        return await handle_dev_command(phone, text)
+
+    if lower.startswith("/"):
+        custom = None
+        try:
+            custom = dev_zone.handle_custom_command(lower, text)
+        except Exception as e:
+            logger.error("dev_zone.handle_custom_command fallo: %s", e)
+            custom = "⚠️ El comando custom tiro un error: " + str(e)[:200]
+        if custom is not None:
+            return await send_whatsapp(phone, custom)
 
     if lower in ["resumen", "como voy", "status"]:
         return await send_whatsapp(phone, format_summary(get_today_summary()))
@@ -963,6 +1326,27 @@ async def process_message(phone, text):
         return await send_whatsapp(phone, format_tasks(get_pending_tasks()))
     if lower in ["ideas", "mis ideas"]:
         return await send_whatsapp(phone, format_ideas(get_recent_ideas()))
+    if lower in ["cine", "cartelera", "pelis", "peliculas", "películas"]:
+        today = datetime.now(tz).date().isoformat()
+        await send_whatsapp(phone, "🎬 Buscando cartelera de hoy en Cartagena...")
+        try:
+            films = await cinecolombia.list_films_with_showtimes_today(today)
+        except Exception as e:
+            logger.error("cineco list_films fallo: %s", e)
+            return await send_whatsapp(phone, "❌ No pude traer la cartelera ahora. Intenta en un minuto.")
+        if not films:
+            clear_cinema_session(phone)
+            return await send_whatsapp(phone, "🎬 No hay funciones disponibles hoy en Cartagena.")
+        save_cinema_session(phone, films, today)
+        return await send_whatsapp(phone, format_cartelera(films, today))
+
+    cine_sess = get_cinema_session(phone)
+    if cine_sess and lower.isdigit():
+        idx = int(lower)
+        films = cine_sess["films"]
+        if 1 <= idx <= len(films):
+            return await send_whatsapp(phone, format_film_showtimes(films[idx - 1]))
+
     if lower == "ayuda":
         return await send_whatsapp(
             phone,
@@ -970,7 +1354,8 @@ async def process_message(phone, text):
             "*Comandos rapidos:*\n"
             "\U0001f4cb *pendientes* = ver tareas\n"
             "\U0001f4a1 *ideas* = ver ideas\n"
-            "\U0001f4ca *resumen* = resumen del dia\n\n"
+            "\U0001f4ca *resumen* = resumen del dia\n"
+            "\U0001f3ac *cine* = cartelera de hoy en Cartagena\n\n"
             "*Hablame natural:*\n"
             "- _Tengo que llamar a Juan manana_\n"
             "- _Idea: hacer webinar de YAVE_\n"
@@ -979,6 +1364,9 @@ async def process_message(phone, text):
             "*Ensenami cosas:*\n"
             "- _Recuerda que mi prioridad es cerrar 3 ventas_\n"
             "- _Ten en cuenta que el lanzamiento es en abril_\n\n"
+            "*Desarrollo en vivo:*\n"
+            "- `/dev <que agregar>` -> propone cambio en dev_zone.py\n"
+            "- `/dev ayuda` -> mas detalle\n\n"
             "*Tambien puedes enviarme notas de voz!*"
         )
 
@@ -1008,9 +1396,25 @@ async def process_message(phone, text):
     elif intent == "reminder":
         rid = add_reminder(data)
         msg = "\u23f0 Recordatorio #" + str(rid) + "\n_" + data.get("message", "") + "_\n\U0001f550 " + data.get("remind_at", "")
+        cadencia = format_recurrence_es(data.get("recurrence"))
+        if cadencia:
+            msg = msg + "\n\U0001f501 " + cadencia
         if response_text:
             msg = msg + "\n\n" + response_text
         await send_whatsapp(phone, msg)
+
+    elif intent == "cancel_reminder":
+        search = data.get("search_term", "")
+        found = cancel_reminder(search)
+        if found and found.startswith("MULTIPLE:"):
+            await send_whatsapp(phone, "\U0001f914 Varios coinciden:\n" + found[9:] + "\n\nSe mas especifico.")
+        elif found:
+            msg = "\U0001f5d1 Recordatorio cancelado: *" + found + "*"
+            if response_text:
+                msg = msg + "\n\n" + response_text
+            await send_whatsapp(phone, msg)
+        else:
+            await send_whatsapp(phone, "\U0001f50d No encontre ese recordatorio activo.")
 
     elif intent == "query":
         qt = data.get("query_type", "pending_tasks")
@@ -1026,6 +1430,8 @@ async def process_message(phone, text):
                 await send_whatsapp(phone, "\u26a0\ufe0f *VENCIDAS*\n" + format_tasks(tasks))
             else:
                 await send_whatsapp(phone, "\u2705 Nada vencido.")
+        elif qt == "reminders":
+            await send_whatsapp(phone, format_reminders(get_active_reminders()))
         else:
             await send_whatsapp(phone, response_text)
 
@@ -1176,8 +1582,12 @@ scheduler = AsyncIOScheduler(timezone=TIMEZONE)
 async def check_reminders():
     for r in get_pending_reminders():
         if MY_PHONE_NUMBER:
-            await send_whatsapp(MY_PHONE_NUMBER, "\u23f0 *RECORDATORIO*\n\n" + r["message"])
-            mark_reminder_sent(r["id"])
+            body = "\u23f0 *RECORDATORIO*\n\n" + r["message"]
+            cadencia = format_recurrence_es(r.get("recurrence"))
+            if cadencia:
+                body = body + "\n\n_(" + cadencia + ")_"
+            await send_whatsapp(MY_PHONE_NUMBER, body)
+            mark_reminder_sent(r["id"], r.get("recurrence"), r.get("remind_at"))
 
 
 async def morning_summary():
@@ -1672,7 +2082,8 @@ async def _flush_buffer(phone: str, wait_seconds: int):
 
 async def buffer_and_process(phone: str, text: str):
     # Comandos rápidos: drenar cualquier buffer pendiente y procesar de inmediato.
-    if text.strip().lower() in QUICK_COMMANDS:
+    stripped = text.strip().lower()
+    if stripped in QUICK_COMMANDS or stripped.startswith("/"):
         async with _buffer_lock:
             existing = _buffer_tasks.pop(phone, None)
             buffered = _message_buffers.pop(phone, [])

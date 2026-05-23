@@ -3,3 +3,4 @@ __pycache__/
 assistant.db
 .env
 *.db-journal
+.venv*/

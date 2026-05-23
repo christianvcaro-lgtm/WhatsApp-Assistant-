@@ -14,12 +14,24 @@ Bot de WhatsApp que captura tareas, ideas, te manda recordatorios y te da visibi
 
 ## Comandos rápidos (sin gastar tokens)
 
-|Comando     |Acción              |
-|------------|--------------------|
-|`pendientes`|Ver todas las tareas|
-|`ideas`     |Ver ideas recientes |
-|`resumen`   |Resumen del día     |
-|`ayuda`     |Ver comandos        |
+|Comando     |Acción                              |
+|------------|------------------------------------|
+|`pendientes`|Ver todas las tareas                |
+|`ideas`     |Ver ideas recientes                 |
+|`resumen`   |Resumen del día                     |
+|`cine`      |Cartelera de hoy (Cartagena) + link |
+|`ayuda`     |Ver comandos                        |
+
+### Cine (Cartagena)
+
+`cine` (o `cartelera`, `pelis`) trae las pelis con función hoy en los 3 cines
+de Cartagena (Caribe Plaza, Paseo La Castellana, Plaza Bocagrande). Respondes
+con el número de la película (ej: `1`) y te paso los horarios con link directo
+al checkout — eliges asientos y pagas en el sitio.
+
+Bajo el capó usa la API de Vista Omnia. El JWT se refresca automáticamente con
+Playwright headless (la home está detrás de Cloudflare). Por eso Railway
+necesita Chromium — el `nixpacks.toml` lo instala en el build.
 
 ## Setup paso a paso
 
@@ -87,11 +99,56 @@ Manda un mensaje al número de prueba (+1 555 141 1988):
 ```
 whatsapp-assistant/
 ├── app.py              # Todo el bot (servidor + lógica + DB)
+├── dev_assistant.py    # Comando /dev (propone + commitea cambios)
+├── dev_zone.py         # Sandbox editable via /dev (comandos custom)
+├── gcal.py             # Integración Google Calendar
+├── gmail.py            # Integración Gmail
 ├── requirements.txt    # Dependencias Python
-├── Procfile           # Comando de inicio para Railway
-├── assistant.db       # SQLite (se crea automático)
-└── README.md          # Este archivo
+├── Procfile            # Comando de inicio para Railway
+└── README.md           # Este archivo
 ```
+
+## Desarrollo desde WhatsApp con `/dev`
+
+Puedes agregar funciones nuevas mandando un mensaje:
+
+```
+/dev agrega un comando /mood que devuelva una frase motivacional al azar
+```
+
+El bot:
+
+1. Llama al LLM para generar el nuevo contenido de `dev_zone.py`
+2. Te responde con un resumen + diff truncado
+3. Esperas a confirmar con `/dev ok` (o descartas con `/dev no`)
+4. Al confirmar, hace commit a GitHub via API → Railway redeploya solo
+
+**Restricciones de seguridad:**
+
+- Solo edita `dev_zone.py` (no toca `app.py`, `gcal.py`, `gmail.py`)
+- Solo el `MY_PHONE_NUMBER` configurado puede usar `/dev`
+- Cada cambio requiere `/dev ok` explícito
+- Propuesta expira en 15 minutos
+- Valida que el código generado sea Python sintácticamente válido antes de aplicar
+
+**Subcomandos:**
+
+|Comando         |Acción                              |
+|----------------|------------------------------------|
+|`/dev <texto>`  |Propone un cambio                   |
+|`/dev ok`       |Aplica la propuesta pendiente       |
+|`/dev no`       |Descarta la propuesta pendiente     |
+|`/dev pending`  |Muestra la propuesta pendiente      |
+|`/dev ver`      |Muestra contenido actual de dev_zone|
+|`/dev ayuda`    |Ayuda del comando                   |
+
+**Env vars adicionales (Railway):**
+
+|Variable      |Valor                                                  |
+|--------------|-------------------------------------------------------|
+|`GITHUB_TOKEN`|PAT con permiso `repo` write para hacer commits        |
+|`GITHUB_REPO` |Repo en formato `usuario/repo` (ej: `tu-user/tu-repo`) |
+|`DEV_MODEL`   |(Opcional) Modelo OpenAI a usar (default `gpt-5.4-mini`)|
 
 ## Endpoints auxiliares
 
